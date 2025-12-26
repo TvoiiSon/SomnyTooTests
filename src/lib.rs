@@ -1,13 +1,17 @@
 pub mod config;
+pub mod test_server;
+pub mod test_client;
+
+pub mod tests {
+    pub mod send_ping_packet;
+}
 
 // CORE
 pub mod core {
-    pub mod handlers {
-
-    }
     pub mod protocol {
         pub mod error;
         pub mod crypto {
+            pub mod crypto_pool;
             pub mod cipher {
                 pub mod aes_gcm;
                 pub mod key_derivation;
@@ -51,9 +55,8 @@ pub mod core {
         }
         pub mod server {
             pub mod tcp_server;
-            pub mod connection_manager;
             pub mod session_manager;
-            pub mod client_packet_sender;
+            pub mod connection_manager;
         }
     }
 }
