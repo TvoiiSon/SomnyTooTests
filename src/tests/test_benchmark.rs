@@ -1,13 +1,13 @@
 use anyhow::Result;
 use tracing::{info, debug};
 use std::time::{Instant, Duration};
+use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 
-use crate::core::protocol::crypto::handshake::handshake::{perform_handshake, HandshakeRole};
-use crate::core::protocol::packets::encoder::packet_builder::PacketBuilder;
-use crate::core::protocol::packets::decoder::packet_parser::PacketParser;
-use crate::core::protocol::packets::encoder::frame_writer::write_frame;
-use crate::core::protocol::packets::decoder::frame_reader::read_frame;
+use crate::core::protocol::phantom_crypto::handshake::{perform_phantom_handshake, HandshakeRole};
+use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
+use crate::core::protocol::phantom_crypto::keys::PhantomSession;
 use crate::test_client::TestClient;
 use crate::test_server::TestServer;
 
@@ -27,13 +27,18 @@ pub async fn benchmark_handshake_and_processing() -> Result<BenchmarkResults> {
     info!("TCP connect + handshake (через TestClient): {:?}", connect_time);
 
     // Дополнительно: извлекаем session_id из уже установленного соединения
-    let session_keys = client.ctx;
-    info!("Session ID: {}", hex::encode(&session_keys.session_id));
+    let session_id = client.session.session_id();
+    info!("Session ID: {}", hex::encode(session_id));
 
     // 2. Измерение времени шифрования пакета
+    let packet_processor = PhantomPacketProcessor::new();
     let encrypt_start = Instant::now();
-    let test_payload = b"Test payload for benchmark";
-    let encrypted_packet = PacketBuilder::build_encrypted_packet(&session_keys, 0x01, test_payload).await;
+    let test_payload = b"benchmark";
+    let encrypted_packet = packet_processor.create_outgoing(
+        &client.session,
+        0x20, // Data packet type
+        test_payload
+    ).map_err(|e| anyhow::anyhow!("Failed to create packet: {:?}", e))?;
     let encrypt_time = encrypt_start.elapsed();
     results.encryption_time = encrypt_time;
     info!("Encryption time: {:?}", encrypt_time);
@@ -41,25 +46,31 @@ pub async fn benchmark_handshake_and_processing() -> Result<BenchmarkResults> {
 
     // 3. Измерение времени отправки пакета
     let send_start = Instant::now();
-    write_frame(&mut client.stream, &encrypted_packet).await?;
+    client.stream.write_all(&encrypted_packet).await?;
+    client.stream.flush().await?;
     let send_time = send_start.elapsed();
     results.send_time = send_time;
     info!("Send time: {:?}", send_time);
 
     // 4. Измерение времени получения ответа (RTT)
     let receive_start = Instant::now();
-    let response_frame = read_frame(&mut client.stream).await?;
+    let mut buffer = vec![0u8; 1024];
+    let n = client.stream.read(&mut buffer).await?;
+    let response_data = buffer[..n].to_vec();
     let receive_time = receive_start.elapsed();
     results.receive_time = receive_time;
     info!("Receive time (RTT): {:?}", receive_time);
 
     // 5. Измерение времени расшифровки ответа
     let decrypt_start = Instant::now();
-    let (packet_type, plaintext) = PacketParser::decode_packet(&session_keys, &response_frame)?;
+    let (packet_type, plaintext) = packet_processor.process_incoming(
+        &response_data,
+        &client.session
+    ).map_err(|e| anyhow::anyhow!("Failed to decode packet: {:?}", e))?;
     let decrypt_time = decrypt_start.elapsed();
     results.decryption_time = decrypt_time;
     info!("Decryption time: {:?}", decrypt_time);
-    debug!("Response packet type: {}, plaintext: {} bytes", packet_type, plaintext.len());
+    debug!("Response packet type: 0x{:02X}, plaintext: {} bytes", packet_type, plaintext.len());
 
     // 6. Общее время (от подключения до получения ответа)
     let total_time = connect_start.elapsed();
@@ -74,8 +85,7 @@ pub async fn benchmark_handshake_and_processing() -> Result<BenchmarkResults> {
 
     // 8. Разделяем handshake время (оценка)
     // В TestClient.connect() уже включает handshake, поэтому вычитаем TCP connect
-    // Это грубая оценка, но лучше чем ничего
-    let estimated_handshake_time = connect_time.saturating_sub(Duration::from_millis(1)); // Примерная поправка
+    let estimated_handshake_time = connect_time.saturating_sub(Duration::from_millis(1));
     results.handshake_time = estimated_handshake_time;
 
     results.print_summary();
@@ -99,22 +109,24 @@ pub async fn benchmark_detailed() -> Result<DetailedBenchmarkResults> {
 
     // Этап 2: Handshake
     let handshake_start = Instant::now();
-    let handshake_result = perform_handshake(&mut stream, HandshakeRole::Client).await?;
+    let handshake_result = perform_phantom_handshake(&mut stream, HandshakeRole::Client)
+        .await
+        .map_err(|e| anyhow::anyhow!("Handshake failed: {:?}", e))?;
     let handshake_time = handshake_start.elapsed();
     results.handshake_time = handshake_time;
 
-    let session_keys = handshake_result.session_keys;
+    let session = Arc::new(handshake_result.session);
     info!("Handshake time: {:?}", handshake_time);
-    info!("Session ID: {}", hex::encode(&session_keys.session_id));
+    info!("Session ID: {}", hex::encode(session.session_id()));
 
     // Создаем TestClient из существующего соединения
     let client = TestClient {
         stream,
-        ctx: session_keys.clone(),
+        session: session.clone(),
     };
 
     // Дальнейшие измерения как в обычном бенчмарке
-    let benchmark_results = benchmark_with_existing_client(client, session_keys).await?;
+    let benchmark_results = benchmark_with_existing_client(client, session).await?;
 
     // Объединяем результаты
     results.merge_basic_results(benchmark_results);
@@ -127,32 +139,43 @@ pub async fn benchmark_detailed() -> Result<DetailedBenchmarkResults> {
 /// Бенчмарк с существующим клиентом (для повторного использования)
 async fn benchmark_with_existing_client(
     mut client: TestClient,
-    session_keys: crate::core::protocol::crypto::key_manager::session_keys::SessionKeys,
+    session: Arc<PhantomSession>,
 ) -> Result<BenchmarkResults> {
     let mut results = BenchmarkResults::new();
 
     // Измерение времени шифрования пакета
+    let packet_processor = PhantomPacketProcessor::new();
     let encrypt_start = Instant::now();
-    let test_payload = b"";
-    let encrypted_packet = PacketBuilder::build_encrypted_packet(&session_keys, 0x01, test_payload).await;
+    let test_payload = b"benchmark";
+    let encrypted_packet = packet_processor.create_outgoing(
+        &session,
+        0x20,
+        test_payload
+    ).map_err(|e| anyhow::anyhow!("Failed to create packet: {:?}", e))?;
     let encrypt_time = encrypt_start.elapsed();
     results.encryption_time = encrypt_time;
 
     // Измерение времени отправки пакета
     let send_start = Instant::now();
-    write_frame(&mut client.stream, &encrypted_packet).await?;
+    client.stream.write_all(&encrypted_packet).await?;
+    client.stream.flush().await?;
     let send_time = send_start.elapsed();
     results.send_time = send_time;
 
     // Измерение времени получения ответа
     let receive_start = Instant::now();
-    let response_frame = read_frame(&mut client.stream).await?;
+    let mut buffer = vec![0u8; 1024];
+    let n = client.stream.read(&mut buffer).await?;
+    let response_data = buffer[..n].to_vec();
     let receive_time = receive_start.elapsed();
     results.receive_time = receive_time;
 
     // Измерение времени расшифровки
     let decrypt_start = Instant::now();
-    let (_packet_type, _plaintext) = PacketParser::decode_packet(&session_keys, &response_frame)?;
+    let (_packet_type, _plaintext) = packet_processor.process_incoming(
+        &response_data,
+        &session
+    ).map_err(|e| anyhow::anyhow!("Failed to decode packet: {:?}", e))?;
     let decrypt_time = decrypt_start.elapsed();
     results.decryption_time = decrypt_time;
 

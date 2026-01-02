@@ -10,15 +10,17 @@ async fn main() {
     // Инициализация logging
     init_logging();
 
+    let _ = send_ping_packet().await;
+
     // let _ = benchmark_handshake_and_processing().await;
     // let _ = benchmark_detailed().await;
     // let _ = benchmark_detailed_multiple(3).await;
-    let _ = benchmark_multiple_iterations(3).await;
+    // let _ = benchmark_multiple_iterations(3).await;
 }
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("debug"));
 
     let subscriber = FmtSubscriber::builder()
         .with_env_filter(filter)
