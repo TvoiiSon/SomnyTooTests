@@ -4,7 +4,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::io::AsyncWriteExt; // Убрали AsyncReadExt, т.к. не используется
 
-use crate::core::protocol::phantom_crypto::handshake::{perform_phantom_handshake, HandshakeRole};
+use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
 use crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool;

@@ -6,9 +6,10 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::{Instant, Duration};
 use tracing::{info, warn, debug};
 
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
+use crate::core::protocol::packets::processor::packet_service::{PhantomPacketService};
 
 const MAX_PACKET_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -62,9 +63,11 @@ pub async fn handle_phantom_client_connection(
     phantom_crypto_pool: Arc<PhantomCryptoPool>,
     phantom_session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
+    // Добавляем PhantomPacketService в параметры
+    packet_service: Arc<PhantomPacketService>,
 ) -> anyhow::Result<()> {
     let session_id = session.session_id();
-    info!(target: "server", "👻 Starting phantom connection for session: {} from {}",
+    info!(target: "server", "💓 Starting heartbeat-integrated phantom connection for session: {} from {}",
         hex::encode(session_id), peer);
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -76,7 +79,7 @@ pub async fn handle_phantom_client_connection(
         shutdown_tx
     ).await;
 
-    // Запускаем writer task
+    // Запускаем writer task с поддержкой heartbeat
     let writer_task = tokio::spawn(phantom_write_task(
         writer,
         session_id.to_vec(),
@@ -90,7 +93,7 @@ pub async fn handle_phantom_client_connection(
             peer,
             session.clone(),
             phantom_crypto_pool,
-            phantom_session_manager.clone(),
+            packet_service.clone(), // Передаем packet_service
         ) => {
             result
         }
@@ -114,21 +117,59 @@ pub async fn handle_phantom_client_connection(
 async fn phantom_write_task(
     writer: tokio::net::tcp::OwnedWriteHalf,
     session_id: Vec<u8>,
-    peer: SocketAddr,
+    _peer: SocketAddr,
 ) {
     let writer = writer;
+    let mut last_heartbeat_sent = Instant::now();
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
     loop {
         match writer.writable().await {
             Ok(()) => {
+                // Проверяем, нужно ли отправить heartbeat
+                if last_heartbeat_sent.elapsed() >= HEARTBEAT_INTERVAL {
+                    // Отправляем heartbeat
+                    if let Err(e) = send_heartbeat(&writer, &session_id).await {
+                        warn!("💓 Failed to send heartbeat to session {}: {}",
+                            hex::encode(&session_id), e);
+                    } else {
+                        debug!("💓 Heartbeat sent to session {}", hex::encode(&session_id));
+                        last_heartbeat_sent = Instant::now();
+                    }
+                }
+
                 // Здесь будет логика отправки данных
                 // Пока просто держим соединение
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(e) => {
-                warn!("👻 Phantom write task error for session {} from {}: {}",
-                    hex::encode(&session_id), peer, e);
+                warn!("👻 Phantom write task error for session {}: {}",
+                    hex::encode(&session_id), e);
                 break;
+            }
+        }
+    }
+}
+
+async fn send_heartbeat(
+    writer: &tokio::net::tcp::OwnedWriteHalf,
+    session_id: &[u8],
+) -> anyhow::Result<()> {
+    // Создаем простый heartbeat пакет (0x10 - тип heartbeat)
+    let heartbeat_packet = vec![0x10];
+
+    // В реальной реализации здесь должна быть криптография
+    match writer.try_write(&heartbeat_packet) {
+        Ok(_) => {
+            debug!("💓 Heartbeat packet sent for session {}", hex::encode(session_id));
+            Ok(())
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                // Попробуем в следующий раз
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Failed to send heartbeat: {}", e))
             }
         }
     }
@@ -139,15 +180,17 @@ async fn phantom_process_loop(
     peer: SocketAddr,
     session: Arc<PhantomSession>,
     crypto_pool: Arc<PhantomCryptoPool>,
-    session_manager: Arc<PhantomSessionManager>,
+    packet_service: Arc<PhantomPacketService>, // Добавляем packet_service
 ) -> anyhow::Result<()> {
     let mut last_activity = Instant::now();
+    let _session_id = session.session_id().to_vec();
 
     loop {
         // Проверяем таймаут неактивности
         if last_activity.elapsed() > INACTIVITY_TIMEOUT {
             warn!(target: "server", "👻 {} inactive for {:?}, closing connection",
                 peer, last_activity.elapsed());
+
             break;
         }
 
@@ -170,9 +213,9 @@ async fn phantom_process_loop(
                             peer,
                             &session,
                             &crypto_pool,
-                            &session_manager,
+                            &packet_service, // Передаем packet_service
                         ).await {
-                            warn!("👻 Failed to handle phantom packet from {}: {}", peer, e);
+                            warn!("👻 Failed to handle phantom packet: {}", e);
                         }
                     }
                     Err(e) => {
@@ -203,8 +246,10 @@ async fn handle_phantom_packet(
     peer: SocketAddr,
     session: &Arc<PhantomSession>,
     crypto_pool: &Arc<PhantomCryptoPool>,
-    session_manager: &Arc<PhantomSessionManager>,
+    packet_service: &Arc<PhantomPacketService>,
 ) -> anyhow::Result<()> {
+    let start = Instant::now();
+
     let session_id = session.session_id();
 
     // Проверка размера пакета
@@ -213,32 +258,34 @@ async fn handle_phantom_packet(
         return Ok(());
     }
 
-    // Обработка heartbeat пакетов (упрощенная версия без heartbeat manager)
+    // Обработка heartbeat пакетов (0x10)
     if data.len() >= 1 && data[0] == 0x10 {
         debug!(target: "phantom_heartbeat",
             "👻 Heartbeat received from {} session: {}",
             peer, hex::encode(session_id));
-
-        // Обновляем активность сессии
-        session_manager.on_heartbeat_received(session_id).await;
         return Ok(());
     }
+
+    debug!("👻 Processing phantom packet from {}: {} bytes", peer, data.len());
+    debug!("👻 Packet hex (first 64): {}", hex::encode(&data[..data.len().min(64)]));
 
     // Декодируем и обрабатываем пакет через фантомный криптопул
     match crypto_pool.decrypt(session.clone(), data.to_vec()).await {
         Ok((packet_type, plaintext)) => {
-            debug!(
-                "👻 Successfully decrypted phantom packet from {}: type=0x{:02X}, size={} bytes",
-                peer, packet_type, plaintext.len()
-            );
+            let elapsed = start.elapsed();
+            debug!("👻 Successfully decrypted phantom packet from {}: type=0x{:02X}, size={} bytes in {:?}",
+                peer, packet_type, plaintext.len(), elapsed);
 
-            // Обработка расшифрованных данных
-            process_decrypted_phantom_payload(
+            // Обработка расшифрованных данных через PhantomPacketService
+            if let Err(e) = process_decrypted_phantom_payload(
                 packet_type,
-                &plaintext,
+                plaintext,
                 peer,
-                session,
-            ).await;
+                session.clone(),
+                packet_service,
+            ).await {
+                warn!("👻 Failed to process phantom payload from {}: {}", peer, e);
+            }
         }
         Err(e) => {
             warn!("👻 Failed to decrypt phantom packet from {}: {}", peer, e);
@@ -250,10 +297,11 @@ async fn handle_phantom_packet(
 
 async fn process_decrypted_phantom_payload(
     packet_type: u8,
-    plaintext: &[u8],
+    plaintext: Vec<u8>, // Принимаем владение данными
     peer: SocketAddr,
-    session: &Arc<PhantomSession>,
-) {
+    session: Arc<PhantomSession>,
+    packet_service: &Arc<PhantomPacketService>,
+) -> anyhow::Result<()> {
     debug!(
         "👻 Processing phantom payload: type=0x{:02X}, size={} bytes, session={}, peer={}",
         packet_type,
@@ -262,19 +310,26 @@ async fn process_decrypted_phantom_payload(
         peer
     );
 
-    // Бизнес-логика обработки данных
-    match packet_type {
-        0x20 => { // Data packet
-            info!("👻 Data packet received from {}: {} bytes",
-                peer, plaintext.len());
-            // Обработка данных
+    // Вся бизнес-логика теперь вынесена в PhantomPacketService
+    match packet_service.process_packet(
+        session.clone(),
+        packet_type,
+        plaintext,
+        peer,
+    ).await {
+        Ok(processing_result) => {
+            // Здесь можно обработать результат, если нужно отправить ответ
+            debug!("👻 Packet processing result: should_encrypt={}, response_size={} bytes",
+                   processing_result.should_encrypt, processing_result.response.len());
+
+            // TODO: Добавить логику отправки ответа клиенту, если необходимо
+            // Это может потребовать доступ к writer или отдельный канал для ответов
         }
-        0x30 => { // Control packet
-            info!("👻 Control packet received from {}", peer);
-            // Обработка управления
-        }
-        _ => {
-            info!("👻 Unknown packet type 0x{:02X} from {}", packet_type, peer);
+        Err(e) => {
+            warn!("👻 Packet processing error for session {}: {}",
+                  hex::encode(session.session_id()), e);
         }
     }
+
+    Ok(())
 }

@@ -1,94 +1,164 @@
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{Instant, Duration};
-use tracing::{info, error, warn, debug};
+use std::time::{Instant, Duration};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tracing::{warn, debug, info};
 
-use crate::core::protocol::phantom_crypto::{
-    keys::PhantomSession,
-    packet::PhantomPacketProcessor,
-};
+use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 use crate::core::protocol::error::{ProtocolResult, ProtocolError, CryptoError};
+use crate::core::protocol::phantom_crypto::{
+    core::keys::PhantomSession,
+    runtime::runtime::PhantomRuntime,
+    optimization::batch_processor::{PhantomBatch, PhantomBatchProcessor},
+};
 
-#[derive(Clone)]
+/// Полностью оптимизированный криптографический пул
 pub struct PhantomCryptoPool {
-    tx: mpsc::Sender<PhantomCryptoTask>,
-    batch_tx: mpsc::Sender<PhantomBatchTask>,
-    packet_processor: Arc<Mutex<PhantomPacketProcessor>>, // Теперь с Mutex для внутренних буферов
+    runtime: Arc<PhantomRuntime>,
+    batch_processor: Arc<PhantomBatchProcessor>,
+    task_tx: mpsc::Sender<CryptoTask>,
+    batch_tx: mpsc::Sender<BatchTask>,
+    concurrency_limiter: Arc<Semaphore>,
+    packet_processor: Arc<PhantomPacketProcessor>,
 }
 
-pub enum PhantomCryptoTask {
-    Single {
+enum CryptoTask {
+    Decrypt {
         session: Arc<PhantomSession>,
         payload: Vec<u8>,
         resp: oneshot::Sender<ProtocolResult<(u8, Vec<u8>)>>,
     },
-    Batch {
-        tasks: Vec<(Arc<PhantomSession>, Vec<u8>)>,
-        resp: oneshot::Sender<ProtocolResult<Vec<ProtocolResult<(u8, Vec<u8>)>>>>,
+    Encrypt {
+        session: Arc<PhantomSession>,
+        packet_type: u8,
+        plaintext: Vec<u8>,
+        resp: oneshot::Sender<ProtocolResult<Vec<u8>>>,
     },
 }
 
-pub struct PhantomBatchTask {
-    pub tasks: Vec<(Arc<PhantomSession>, Vec<u8>)>,
-    pub resp: oneshot::Sender<ProtocolResult<Vec<ProtocolResult<(u8, Vec<u8>)>>>>,
+struct BatchTask {
+    batch: PhantomBatch,
+    resp: oneshot::Sender<ProtocolResult<BatchResult>>,
+}
+
+pub struct BatchResult {
+    pub packet_types: Vec<u8>,
+    pub data_sizes: Vec<usize>,
+    pub errors: Vec<Option<ProtocolError>>,
 }
 
 impl PhantomCryptoPool {
-    pub fn spawn(threads: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<PhantomCryptoTask>(4096);
-        let (batch_tx, batch_rx) = mpsc::channel::<PhantomBatchTask>(1024);
+    pub fn spawn(num_workers: usize) -> Self {
+        let runtime = Arc::new(PhantomRuntime::new(num_workers));
+        let batch_processor = runtime.batch_processor();
+        let packet_processor = Arc::new(PhantomPacketProcessor::new());
 
-        // Создаем процессоры с предвыделенными буферами для каждого воркера
-        let packet_processor = Arc::new(Mutex::new(PhantomPacketProcessor::new()));
+        let (task_tx, task_rx) = mpsc::channel::<CryptoTask>(8192);
+        let (batch_tx, batch_rx) = mpsc::channel::<BatchTask>(1024);
 
-        let rx = Arc::new(Mutex::new(rx));
-        let batch_rx = Arc::new(Mutex::new(batch_rx));
+        let concurrency_limiter = Arc::new(Semaphore::new(num_workers * 2));
 
-        // Основные воркеры
-        for _ in 0..threads {
-            let rx = Arc::clone(&rx);
-            let packet_processor = Arc::clone(&packet_processor);
-            tokio::spawn(async move {
-                let worker = PhantomCryptoWorker::new();
-                worker.run(rx, packet_processor).await;
-            });
+        // Создаем один worker вместо нескольких
+        let worker = CryptoWorker::new(
+            0,
+            runtime.clone(),
+            batch_processor.clone(),
+            packet_processor.clone(),
+            task_rx,
+            batch_rx,
+            concurrency_limiter.clone(),
+        );
+
+        // Запускаем worker
+        tokio::spawn(async move {
+            worker.run().await;
+        });
+
+        info!("✅ PhantomCryptoPool initialized with {} workers", num_workers);
+        info!("  - Batch processor: ready");
+        info!("  - Packet processor: ready");
+        info!("  - Concurrency limit: {}", num_workers * 2);
+
+        Self {
+            runtime,
+            batch_processor,
+            task_tx,
+            batch_tx,
+            concurrency_limiter,
+            packet_processor,
         }
-
-        // Batch воркеры
-        for _ in 0..threads / 2 {
-            let batch_rx = Arc::clone(&batch_rx);
-            let packet_processor = Arc::clone(&packet_processor);
-            tokio::spawn(async move {
-                let worker = PhantomCryptoWorker::new();
-                worker.run_batch(batch_rx, packet_processor).await;
-            });
-        }
-
-        PhantomCryptoPool { tx, batch_tx, packet_processor }
     }
 
+    #[inline]
     pub async fn decrypt(
         &self,
         session: Arc<PhantomSession>,
-        payload: Vec<u8>
+        payload: Vec<u8>,
     ) -> ProtocolResult<(u8, Vec<u8>)> {
-        let (tx_resp, rx_resp) = oneshot::channel();
+        let _permit = self.concurrency_limiter.acquire().await.unwrap();
+        let start = Instant::now();
 
-        let task = PhantomCryptoTask::Single {
+        let (tx, rx) = oneshot::channel();
+
+        let task = CryptoTask::Decrypt {
             session,
             payload,
-            resp: tx_resp,
+            resp: tx,
         };
 
-        if self.tx.send(task).await.is_err() {
+        if self.task_tx.send(task).await.is_err() {
             return Err(ProtocolError::Crypto {
                 source: CryptoError::DecryptionFailed {
-                    reason: "Failed to send decryption task".to_string()
+                    reason: "Failed to send task".to_string()
                 }
             });
         }
 
-        match tokio::time::timeout(Duration::from_secs(3), rx_resp).await {
+        match tokio::time::timeout(Duration::from_millis(10), rx).await {
+            Ok(Ok(result)) => {
+                debug!("Decryption completed in {:?}", start.elapsed());
+                result
+            }
+            Ok(Err(_)) => Err(ProtocolError::Crypto {
+                source: CryptoError::DecryptionFailed {
+                    reason: "Channel error".to_string()
+                }
+            }),
+            Err(_) => {
+                warn!("Decryption timeout");
+                Err(ProtocolError::Timeout {
+                    duration: Duration::from_millis(10)
+                })
+            }
+        }
+    }
+
+    #[inline]
+    pub async fn encrypt(
+        &self,
+        session: Arc<PhantomSession>,
+        packet_type: u8,
+        plaintext: Vec<u8>,
+    ) -> ProtocolResult<Vec<u8>> {
+        let _permit = self.concurrency_limiter.acquire().await.unwrap();
+
+        let (tx, rx) = oneshot::channel();
+
+        let task = CryptoTask::Encrypt {
+            session,
+            packet_type,
+            plaintext,
+            resp: tx,
+        };
+
+        if self.task_tx.send(task).await.is_err() {
+            return Err(ProtocolError::Crypto {
+                source: CryptoError::DecryptionFailed {
+                    reason: "Failed to send task".to_string()
+                }
+            });
+        }
+
+        match tokio::time::timeout(Duration::from_millis(5), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ProtocolError::Crypto {
                 source: CryptoError::DecryptionFailed {
@@ -96,281 +166,195 @@ impl PhantomCryptoPool {
                 }
             }),
             Err(_) => {
-                warn!("PhantomCryptoPool decrypt timeout");
+                warn!("Encryption timeout");
                 Err(ProtocolError::Timeout {
-                    duration: Duration::from_secs(3)
+                    duration: Duration::from_millis(5)
                 })
             }
         }
     }
 
-    pub async fn encrypt(
+    pub async fn process_batch(
         &self,
-        session: Arc<PhantomSession>,
-        packet_type: u8,
-        plaintext: Vec<u8>
-    ) -> ProtocolResult<Vec<u8>> {
+        batch: PhantomBatch,
+    ) -> ProtocolResult<BatchResult> {
         let start = Instant::now();
 
-        info!(
-            "Encrypting phantom payload: {} bytes, session: {}, type: 0x{:02X}",
-            plaintext.len(),
-            hex::encode(session.session_id()),
-            packet_type
-        );
-
-        // Используем общий packet processor
-        let mut processor = self.packet_processor.lock().await;
-        let result = processor.create_outgoing(
-            &session,
-            packet_type,
-            &plaintext,
-        );
-
-        let total_time = start.elapsed();
-        debug!(
-            "Phantom encryption complete in {:?}",
-            total_time
-        );
-
-        if total_time > Duration::from_millis(2) {
-            info!("Slow phantom encryption: {:?} for {} bytes", total_time, plaintext.len());
+        if batch.len() == 0 {
+            return Ok(BatchResult {
+                packet_types: Vec::new(),
+                data_sizes: Vec::new(),
+                errors: Vec::new(),
+            });
         }
 
-        result.map(|slice| slice.to_vec()) // Копируем в Vec для совместимости
-    }
+        let (tx, rx) = oneshot::channel();
 
-    pub async fn encrypt_batch(
-        &self,
-        tasks: Vec<(Arc<PhantomSession>, u8, Vec<u8>)>
-    ) -> Vec<ProtocolResult<Vec<u8>>> {
-        use futures::future::join_all;
-
-        let futures = tasks.into_iter().map(|(session, packet_type, plaintext)| {
-            self.encrypt(session, packet_type, plaintext)
-        });
-
-        join_all(futures).await
-    }
-
-    pub async fn decrypt_batch(
-        &self,
-        tasks: Vec<(Arc<PhantomSession>, Vec<u8>)>
-    ) -> Vec<ProtocolResult<(u8, Vec<u8>)>> {
-        if tasks.is_empty() {
-            return Vec::new();
-        }
-
-        let tasks_len = tasks.len();
-        let (tx_resp, rx_resp) = oneshot::channel();
-
-        if tasks_len <= 5 {
-            let task = PhantomCryptoTask::Batch {
-                tasks,
-                resp: tx_resp,
-            };
-
-            if self.tx.send(task).await.is_err() {
-                return create_error_results(
-                    tasks_len,
-                    ProtocolError::Crypto {
-                        source: CryptoError::DecryptionFailed {
-                            reason: "Failed to send batch task".to_string()
-                        }
-                    }
-                );
-            }
-        } else {
-            let batch_task = PhantomBatchTask { tasks, resp: tx_resp };
-            if self.batch_tx.send(batch_task).await.is_err() {
-                return create_error_results(
-                    tasks_len,
-                    ProtocolError::Crypto {
-                        source: CryptoError::DecryptionFailed {
-                            reason: "Failed to send batch task".to_string()
-                        }
-                    }
-                );
-            }
-        }
-
-        match tokio::time::timeout(Duration::from_secs(5), rx_resp).await {
-            Ok(Ok(Ok(results))) => results,
-            Ok(Ok(Err(e))) => {
-                error!("Batch decryption failed: {}", e);
-                create_error_results(tasks_len, e)
-            }
-            Ok(Err(_)) => {
-                warn!("PhantomCryptoPool batch decrypt channel error");
-                create_error_results(
-                    tasks_len,
-                    ProtocolError::Crypto {
-                        source: CryptoError::DecryptionFailed {
-                            reason: "Channel error".to_string()
-                        }
-                    }
-                )
-            }
-            Err(_) => {
-                warn!("PhantomCryptoPool batch decrypt timeout");
-                create_error_results(
-                    tasks_len,
-                    ProtocolError::Timeout {
-                        duration: Duration::from_secs(5)
-                    }
-                )
-            }
-        }
-    }
-}
-
-/// Создает вектор результатов с одинаковой ошибкой
-fn create_error_results(
-    count: usize,
-    error: ProtocolError
-) -> Vec<ProtocolResult<(u8, Vec<u8>)>> {
-    let mut results = Vec::with_capacity(count);
-    for _ in 0..count {
-        results.push(Err(error.clone()));
-    }
-    results
-}
-
-struct PhantomCryptoWorker;
-
-impl PhantomCryptoWorker {
-    fn new() -> Self {
-        Self
-    }
-
-    async fn run(self, rx: Arc<Mutex<mpsc::Receiver<PhantomCryptoTask>>>,
-                 packet_processor: Arc<Mutex<PhantomPacketProcessor>>) {
-        loop {
-            let task = {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            };
-
-            if let Some(task) = task {
-                match task {
-                    PhantomCryptoTask::Single { session, payload, resp } => {
-                        Self::process_single(&packet_processor, session, payload, resp).await;
-                    }
-                    PhantomCryptoTask::Batch { tasks, resp } => {
-                        Self::process_batch(&packet_processor, tasks, resp).await;
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    async fn run_batch(self, batch_rx: Arc<Mutex<mpsc::Receiver<PhantomBatchTask>>>,
-                       packet_processor: Arc<Mutex<PhantomPacketProcessor>>) {
-        loop {
-            let batch_task = {
-                let mut guard = batch_rx.lock().await;
-                guard.recv().await
-            };
-
-            if let Some(batch_task) = batch_task {
-                Self::process_batch_task(&packet_processor, batch_task.tasks, batch_task.resp).await;
-            } else {
-                break;
-            }
-        }
-    }
-
-    async fn process_single(
-        packet_processor: &Arc<Mutex<PhantomPacketProcessor>>,
-        session: Arc<PhantomSession>,
-        payload: Vec<u8>,
-        resp: oneshot::Sender<ProtocolResult<(u8, Vec<u8>)>>
-    ) {
-        let start = Instant::now();
-        let payload_size = payload.len();
-
-        debug!(
-            "Decrypting phantom packet for session: {}, length: {}",
-            hex::encode(session.session_id()),
-            payload_size
-        );
-
-        let mut processor = packet_processor.lock().await;
-        let result = processor.process_incoming(&payload, &session);
-
-        let elapsed = start.elapsed();
-        match &result {
-            Ok((packet_type, data)) => {
-                info!(
-                    "Successfully decrypted phantom packet type: 0x{:02X}, data length: {}, time: {:?}",
-                    packet_type,
-                    data.len(),
-                    elapsed
-                );
-                let _ = resp.send(Ok((*packet_type, data.to_vec())));
-            }
-            Err(e) => {
-                error!(
-                    "Phantom decryption failed for session {}: {}",
-                    hex::encode(session.session_id()),
-                    e
-                );
-                let _ = resp.send(Err(e.clone()));
-            }
+        let task = BatchTask {
+            batch,
+            resp: tx,
         };
 
-        if elapsed > Duration::from_millis(5) {
-            warn!("Slow phantom decryption: {:?} for {} bytes", elapsed, payload_size);
-        } else if elapsed > Duration::from_millis(1) {
-            debug!("Phantom decryption took {:?} for {} bytes", elapsed, payload_size);
+        if self.batch_tx.send(task).await.is_err() {
+            return Err(ProtocolError::Crypto {
+                source: CryptoError::DecryptionFailed {
+                    reason: "Failed to send batch".to_string()
+                }
+            });
         }
-    }
 
-    async fn process_batch(
-        packet_processor: &Arc<Mutex<PhantomPacketProcessor>>,
-        tasks: Vec<(Arc<PhantomSession>, Vec<u8>)>,
-        resp: oneshot::Sender<ProtocolResult<Vec<ProtocolResult<(u8, Vec<u8>)>>>>
-    ) {
-        let batch_start = Instant::now();
-        let batch_size = tasks.len();
-        let mut results = Vec::with_capacity(batch_size);
-
-        info!("Processing phantom batch of {} packets", batch_size);
-
-        let mut processor = packet_processor.lock().await;
-
-        for (i, (session, payload)) in tasks.into_iter().enumerate() {
-            let packet_start = Instant::now();
-
-            let result = processor.process_incoming(&payload, &session)
-                .map(|(packet_type, data)| (packet_type, data.to_vec()));
-
-            let packet_time = packet_start.elapsed();
-            if packet_time > Duration::from_millis(5) {
-                debug!(
-                    "Slow phantom batch decryption [{}]: {:?} for {} bytes",
-                    i, packet_time, payload.len()
-                );
+        match tokio::time::timeout(Duration::from_millis(50), rx).await {
+            Ok(Ok(result)) => {
+                match result {
+                    Ok(batch_result) => {
+                        debug!("Batch of {} processed in {:?}",
+                               batch_result.packet_types.len(), start.elapsed());
+                        Ok(batch_result)
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            results.push(result);
+            Ok(Err(_)) => Err(ProtocolError::Crypto {
+                source: CryptoError::DecryptionFailed {
+                    reason: "Channel error".to_string()
+                }
+            }),
+            Err(_) => {
+                warn!("Batch processing timeout");
+                Err(ProtocolError::Timeout {
+                    duration: Duration::from_millis(50)
+                })
+            }
         }
-
-        let batch_time = batch_start.elapsed();
-        info!(
-            "Phantom batch processing completed in {:?} for {} packets",
-            batch_time, batch_size
-        );
-
-        let _ = resp.send(Ok(results));
     }
 
-    async fn process_batch_task(
-        packet_processor: &Arc<Mutex<PhantomPacketProcessor>>,
-        tasks: Vec<(Arc<PhantomSession>, Vec<u8>)>,
-        resp: oneshot::Sender<ProtocolResult<Vec<ProtocolResult<(u8, Vec<u8>)>>>>
-    ) {
-        Self::process_batch(packet_processor, tasks, resp).await;
+    pub fn runtime(&self) -> &Arc<PhantomRuntime> {
+        &self.runtime
+    }
+
+    // Добавляем методы для использования полей
+    pub fn get_batch_processor(&self) -> &Arc<PhantomBatchProcessor> {
+        &self.batch_processor
+    }
+
+    pub fn get_packet_processor(&self) -> &Arc<PhantomPacketProcessor> {
+        &self.packet_processor
+    }
+
+    pub fn get_stats(&self) -> String {
+        format!(
+            "PhantomCryptoPool: runtime={:?}, batch_processor={:?}, packet_processor={:?}",
+            self.runtime.get_performance_report(),
+            "ready",
+            "ready"
+        )
+    }
+}
+
+struct CryptoWorker {
+    id: usize,
+    runtime: Arc<PhantomRuntime>,
+    batch_processor: Arc<PhantomBatchProcessor>,
+    packet_processor: Arc<PhantomPacketProcessor>,
+    task_rx: mpsc::Receiver<CryptoTask>,
+    batch_rx: mpsc::Receiver<BatchTask>,
+    concurrency_limiter: Arc<Semaphore>,
+}
+
+impl CryptoWorker {
+    fn new(
+        id: usize,
+        runtime: Arc<PhantomRuntime>,
+        batch_processor: Arc<PhantomBatchProcessor>,
+        packet_processor: Arc<PhantomPacketProcessor>,
+        task_rx: mpsc::Receiver<CryptoTask>,
+        batch_rx: mpsc::Receiver<BatchTask>,
+        concurrency_limiter: Arc<Semaphore>,
+    ) -> Self {
+        info!("🔧 Creating CryptoWorker id={}", id);
+        info!("  - Runtime capabilities: {}", runtime.get_performance_report());
+        info!("  - Batch processor ready: {}", !batch_processor.is_empty());
+
+        Self {
+            id,
+            runtime,
+            batch_processor,
+            packet_processor,
+            task_rx,
+            batch_rx,
+            concurrency_limiter,
+        }
+    }
+
+    async fn run(mut self) {
+        info!("🚀 CryptoWorker id={} started", self.id);
+
+        let mut processed_tasks = 0;
+        let mut processed_batches = 0;
+        let start_time = Instant::now();
+
+        loop {
+            tokio::select! {
+                Some(task) = self.task_rx.recv() => {
+                    let _permit = self.concurrency_limiter.acquire().await.unwrap();
+                    self.handle_task(task).await;
+                    processed_tasks += 1;
+
+                    // Периодически логируем статистику
+                    if processed_tasks % 100 == 0 {
+                        debug!("CryptoWorker id={} processed {} tasks in {:?}",
+                               self.id, processed_tasks, start_time.elapsed());
+                    }
+                }
+                Some(batch_task) = self.batch_rx.recv() => {
+                    let _permit = self.concurrency_limiter.acquire().await.unwrap();
+                    self.handle_batch(batch_task).await;
+                    processed_batches += 1;
+
+                    // Периодически логируем статистику
+                    if processed_batches % 10 == 0 {
+                        debug!("CryptoWorker id={} processed {} batches in {:?}",
+                               self.id, processed_batches, start_time.elapsed());
+                    }
+                }
+                else => break,
+            }
+        }
+
+        info!("🛑 CryptoWorker id={} stopped after {:?}", self.id, start_time.elapsed());
+        info!("  - Total tasks processed: {}", processed_tasks);
+        info!("  - Total batches processed: {}", processed_batches);
+        info!("  - Runtime stats: {}", self.runtime.get_performance_report());
+    }
+
+    async fn handle_task(&self, task: CryptoTask) {
+        match task {
+            CryptoTask::Decrypt { session, payload, resp } => {
+                let result = self.packet_processor.process_incoming_vec(&payload, &session);
+                let _ = resp.send(result);
+            }
+            CryptoTask::Encrypt { session, packet_type, plaintext, resp } => {
+                let result = self.packet_processor.create_outgoing_vec(&session, packet_type, &plaintext);
+                let _ = resp.send(result);
+            }
+        }
+    }
+
+    async fn handle_batch(&self, task: BatchTask) {
+        let start = Instant::now();
+        let batch_size = task.batch.len();
+
+        let batch_result = self.batch_processor.process_batch(task.batch);
+
+        let result = BatchResult {
+            packet_types: batch_result.packet_types,
+            data_sizes: batch_result.plaintexts.iter().map(|p| p.len()).collect(),
+            errors: batch_result.errors,
+        };
+
+        let _ = task.resp.send(Ok(result));
+
+        debug!("Batch processing completed in {:?} for {} items (worker id={})",
+               start.elapsed(), batch_size, self.id);
     }
 }

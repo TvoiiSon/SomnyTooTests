@@ -4,7 +4,7 @@ use tracing::{info, error, warn, debug};
 use std::time::{Instant, Duration};
 
 // Заменяем SessionKeys на PhantomSession
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 
 pub struct PacketProcessingResult {
@@ -17,7 +17,9 @@ pub struct PhantomPacketService {
 }
 
 impl PhantomPacketService {
-    pub fn new(phantom_session_manager: Arc<PhantomSessionManager>) -> Self {
+    pub fn new(
+        phantom_session_manager: Arc<PhantomSessionManager>,
+    ) -> Self {
         Self {
             phantom_session_manager,
         }
@@ -25,11 +27,11 @@ impl PhantomPacketService {
 
     pub async fn process_packet(
         &self,
-        session: Arc<PhantomSession>,  // PhantomSession вместо SessionKeys
-        packet_type: u8,  // Просто u8 вместо PacketType enum
+        session: Arc<PhantomSession>,
+        packet_type: u8,
         payload: Vec<u8>,
         client_ip: SocketAddr,
-    ) -> Result<PacketProcessingResult, Box<dyn std::error::Error>> {
+    ) -> Result<PacketProcessingResult, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
         let process_start = Instant::now();
         info!("Processing phantom packet type: 0x{:02X} from {}, session: {}",
               packet_type, client_ip, hex::encode(session.session_id()));
@@ -39,21 +41,22 @@ impl PhantomPacketService {
         let response_data = match packet_type {
             0x01 => { // Ping packet
                 let ping_start = Instant::now();
-                let result = self.handle_ping(payload).await?;
+                let result = self.handle_ping(payload, session.clone(), client_ip).await?;
                 let ping_time = ping_start.elapsed();
                 debug!("Ping processing took {:?}", ping_time);
                 result
             }
-            0x10 => { // Heartbeat packet
-                let heartbeat_start = Instant::now();
-                let result = self.handle_heartbeat(session.session_id(), client_ip).await?;
-                let heartbeat_time = heartbeat_start.elapsed();
-                debug!("Heartbeat processing took {:?}", heartbeat_time);
-                result
-            }
+            // 0x10 => { // Heartbeat packet
+            //     // Heartbeat уже обрабатывается в connection_manager_phantom
+            //     let heartbeat_start = Instant::now();
+            //     let result = self.handle_heartbeat(session.session_id(), client_ip).await?;
+            //     let heartbeat_time = heartbeat_start.elapsed();
+            //     debug!("Heartbeat processing took {:?}", heartbeat_time);
+            //     result
+            // }
             _ => {
                 let unknown_start = Instant::now();
-                let result = self.handle_unknown_packet(packet_type).await?;
+                let result = self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?;
                 let unknown_time = unknown_start.elapsed();
                 warn!("Unknown packet processing took {:?}", unknown_time);
                 result
@@ -72,9 +75,16 @@ impl PhantomPacketService {
         })
     }
 
-    async fn handle_ping(&self, _payload: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    async fn handle_ping(
+        &self,
+        payload: Vec<u8>,
+        _session: Arc<PhantomSession>,
+        client_ip: SocketAddr,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
         let start = Instant::now();
-        info!("Processing Ping packet");
+        info!("👻 Ping packet received from {}: {} ({} bytes)",
+              client_ip, String::from_utf8_lossy(&payload), payload.len());
+
         let result = b"PONG".to_vec();
         let elapsed = start.elapsed();
 
@@ -85,35 +95,43 @@ impl PhantomPacketService {
         Ok(result)
     }
 
-    async fn handle_heartbeat(
+    // async fn handle_heartbeat(
+    //     &self,
+    //     session_id: &[u8],
+    //     client_ip: SocketAddr,
+    // ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
+    //     let start = Instant::now();
+    //     info!("Processing phantom heartbeat from {} session: {}",
+    //           client_ip, hex::encode(session_id));
+    //
+    //     // Update heartbeat status
+    //     let heartbeat_start = Instant::now();
+    //     let heartbeat_result = if self.phantom_session_manager.on_heartbeat_received(session_id).await {
+    //         info!("Heartbeat confirmed for phantom session: {}", hex::encode(session_id));
+    //         b"Heartbeat acknowledged".to_vec()
+    //     } else {
+    //         error!("Heartbeat for unknown phantom session: {}", hex::encode(session_id));
+    //         b"Session not found".to_vec()
+    //     };
+    //     let heartbeat_time = heartbeat_start.elapsed();
+    //
+    //     let total_time = start.elapsed();
+    //     debug!("Phantom heartbeat processing - session update: {:?}, total: {:?}",
+    //            heartbeat_time, total_time);
+    //
+    //     Ok(heartbeat_result)
+    // }
+
+    async fn handle_unknown_packet(
         &self,
-        session_id: &[u8],
+        packet_type: u8,
+        _payload: Vec<u8>,
+        session: Arc<PhantomSession>,
         client_ip: SocketAddr,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let start = Instant::now();
-        info!("Processing phantom heartbeat from {} session: {}",
-              client_ip, hex::encode(session_id));
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
+        error!("Unknown phantom packet type: 0x{:02X} from {}, session: {}",
+               packet_type, client_ip, hex::encode(session.session_id()));
 
-        // Update heartbeat status
-        let heartbeat_start = Instant::now();
-        let heartbeat_result = if self.phantom_session_manager.on_heartbeat_received(session_id).await {
-            info!("Heartbeat confirmed for phantom session: {}", hex::encode(session_id));
-            b"Heartbeat acknowledged".to_vec()
-        } else {
-            error!("Heartbeat for unknown phantom session: {}", hex::encode(session_id));
-            b"Session not found".to_vec()
-        };
-        let heartbeat_time = heartbeat_start.elapsed();
-
-        let total_time = start.elapsed();
-        debug!("Phantom heartbeat processing - session update: {:?}, total: {:?}",
-               heartbeat_time, total_time);
-
-        Ok(heartbeat_result)
-    }
-
-    async fn handle_unknown_packet(&self, packet_type: u8) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        error!("Unknown phantom packet type: 0x{:02X}", packet_type);
         Ok(format!("Unknown phantom packet type: 0x{:02X}", packet_type).into_bytes())
     }
 }

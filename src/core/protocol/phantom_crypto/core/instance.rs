@@ -1,7 +1,7 @@
-use super::{
-    scatterer::MemoryScatterer,
-    keys::PhantomSession,
-    runtime::PhantomRuntime,
+use crate::core::protocol::phantom_crypto::{
+    memory::scatterer::{MemoryScatterer, ScatteredParts},
+    runtime::runtime::PhantomRuntime,
+    core::keys::PhantomSession,
 };
 
 /// Главный интерфейс фантомной криптосистемы
@@ -12,7 +12,11 @@ pub struct PhantomCrypto {
 
 impl PhantomCrypto {
     pub fn new() -> Self {
-        let runtime = PhantomRuntime::new();
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        let runtime = PhantomRuntime::new(num_workers);
         let scatterer = MemoryScatterer::new();
 
         Self {
@@ -27,13 +31,18 @@ impl PhantomCrypto {
     }
 
     /// Рассеивание мастер-ключа
-    pub fn scatter_master_key(&self, master_key: &[u8; 32]) -> super::scatterer::ScatteredParts {
+    pub fn scatter_master_key(&self, master_key: &[u8; 32]) -> ScatteredParts {
         self.scatterer.scatter(master_key)
     }
 
     /// Получает runtime
     pub fn runtime(&self) -> &PhantomRuntime {
         &self.runtime
+    }
+
+    /// Получает scatterer
+    pub fn scatterer(&self) -> &MemoryScatterer {
+        &self.scatterer
     }
 }
 
@@ -53,5 +62,11 @@ impl Default for PhantomConfig {
             enable_hardware_acceleration: true,
             constant_time_enforced: true,
         }
+    }
+}
+
+impl Default for PhantomCrypto {
+    fn default() -> Self {
+        Self::new()
     }
 }

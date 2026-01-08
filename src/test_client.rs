@@ -5,8 +5,12 @@ use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::time::Duration;
 use std::sync::Arc;
 
-use crate::core::protocol::phantom_crypto::handshake::{perform_phantom_handshake, HandshakeRole};
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::{
+    core::{
+        keys::PhantomSession,
+        handshake::{perform_phantom_handshake, HandshakeRole},
+    },
+};
 use crate::config::CONFIG;
 
 pub struct TestClient {

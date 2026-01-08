@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Mutex};
-use tracing::{info, warn};
+use tracing::{info};
 
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
 
 pub struct PhantomSessionEntry {
@@ -74,11 +74,6 @@ impl PhantomSessionManager {
         sessions.contains_key(session_id)
     }
 
-    pub async fn on_heartbeat_received(&self, session_id: &[u8]) -> bool {
-        self.update_activity(session_id).await;
-        true
-    }
-
     pub async fn force_remove_session(&self, session_id: &[u8]) {
         let _guard = self.cleanup_lock.lock().await;
 
@@ -96,29 +91,6 @@ impl PhantomSessionManager {
 
     pub async fn unregister_session(&self, session_id: &[u8]) {
         self.force_remove_session(session_id).await;
-    }
-
-    pub async fn is_connection_alive(&self, session_id: &[u8]) -> bool {
-        let session_exists = self.session_exists(session_id).await;
-
-        if !session_exists {
-            return false;
-        }
-
-        let sessions = self.sessions.read().await;
-        if let Some(entry) = sessions.get(session_id) {
-            // Проверяем таймаут неактивности (60 секунд)
-            let inactive_time = std::time::Instant::now().duration_since(entry.last_activity);
-            if inactive_time > std::time::Duration::from_secs(60) {
-                warn!("👻 Session {} inactive for {:?}", hex::encode(session_id), inactive_time);
-                return false;
-            }
-
-            // Проверяем валидность сессии
-            return entry.session.is_valid();
-        }
-
-        false
     }
 
     pub async fn get_active_sessions(&self) -> Vec<Arc<PhantomSession>> {
