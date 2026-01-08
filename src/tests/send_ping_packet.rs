@@ -18,7 +18,7 @@ pub async fn send_ping_packet() -> Result<Vec<u8>> {
           hex::encode(client.session.session_id()));
 
     // --- Build & send packet ---
-    let packet_processor = PhantomPacketProcessor::new();
+    let mut packet_processor = PhantomPacketProcessor::new();
     let ping_data = b"ping";
 
     // Создаем фантомный пакет (тип 0x01 для ping)

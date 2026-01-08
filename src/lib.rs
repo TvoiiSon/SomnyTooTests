@@ -4,7 +4,6 @@ pub mod test_client;
 
 pub mod tests {
     pub mod send_ping_packet;
-    pub mod test_benchmark;
 }
 
 // CORE
@@ -26,11 +25,9 @@ pub mod core {
         pub mod packets {
             pub mod decoder {
                 pub mod frame_reader;
-                pub mod packet_parser_phantom;
             }
             pub mod encoder {
                 pub mod frame_writer;
-                pub mod packet_builder_phantom;
             }
             pub mod processor {
                 pub mod dispatcher;

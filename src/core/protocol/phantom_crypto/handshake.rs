@@ -31,10 +31,22 @@ pub async fn perform_phantom_handshake(
 ) -> ProtocolResult<PhantomHandshakeResult> {
     let handshake_start = Instant::now();
 
-    match role {
+    let result = match role {
         HandshakeRole::Client => client_phantom_handshake(stream, handshake_start).await,
         HandshakeRole::Server => server_phantom_handshake(stream, handshake_start).await,
+    };
+
+    if let Ok(ref res) = result {
+        let handshake_time = handshake_start.elapsed();
+
+        info!(
+            "Phantom handshake completed in {:?}, session_id: {}",
+            handshake_time,
+            hex::encode(res.session.session_id())
+        );
     }
+
+    result
 }
 
 /// Клиентская часть handshake
@@ -106,7 +118,7 @@ async fn client_phantom_handshake(
     let shared_secret = client_secret.diffie_hellman(&server_pub);
     let shared_secret_bytes = *shared_secret.as_bytes();
 
-    // 7. Создаем фантомную сессию
+    // 7. Создаем фантомную сессию (теперь с Blake3)
     let session = PhantomSession::from_dh_shared(
         &shared_secret_bytes,
         &client_nonce,
@@ -195,7 +207,7 @@ async fn server_phantom_handshake(
     let shared_secret = server_secret.diffie_hellman(&client_pub);
     let shared_secret_bytes = *shared_secret.as_bytes();
 
-    // 7. Создаем фантомную сессию
+    // 7. Создаем фантомную сессию (теперь с Blake3)
     let session = PhantomSession::from_dh_shared(
         &shared_secret_bytes,
         &client_nonce,
