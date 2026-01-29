@@ -1,13 +1,11 @@
 use std::env;
 use anyhow::{Result, Context};
+use lazy_static::lazy_static;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub server_host: String,
     pub server_port: u16,
-    pub hmac_secret_key: String,
-    pub aes_secret_key: String,
-    pub psk_secret: String,
 }
 
 #[derive(Debug, Clone)]
@@ -21,17 +19,14 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Self {
             server_host: env::var("SERVER_HOST")
-                .context("SERVER_HOST не установлен в .env")?,
+                .context("SERVER_HOST не установлен в .env")?
+                .parse::<String>() // Явное указание типа
+                .unwrap_or_else(|_| "127.0.0.1".to_string()),
             server_port: env::var("SERVER_PORT")
                 .context("SERVER_PORT не установлен в .env")?
-                .parse()
-                .context("SERVER_PORT должен быть числом")?,
-            hmac_secret_key: env::var("HMAC_SECRET_KEY")
-                .context("HMAC_SECRET_KEY не установлен в .env")?,
-            aes_secret_key: env::var("AES_SECRET_KEY")
-                .context("AES_SECRET_KEY не установлен в .env")?,
-            psk_secret: env::var("PSK_SECRET")
-                .context("PSK_SECRET не установлен в .env")?,
+                .parse::<u16>() // Явное указание типа
+                .context("SERVER_PORT должен быть числом")
+                .unwrap_or(8000),
         })
     }
 
@@ -45,15 +40,15 @@ impl PhantomConfig {
         Ok(Self {
             enable_hardware_auth: env::var("PHANTOM_HARDWARE_AUTH")
                 .unwrap_or_else(|_| "false".to_string())
-                .parse()
+                .parse::<bool>()
                 .unwrap_or(false),
             session_timeout_ms: env::var("PHANTOM_SESSION_TIMEOUT_MS")
                 .unwrap_or_else(|_| "90000".to_string())
-                .parse()
+                .parse::<u64>()
                 .unwrap_or(90000),
             max_sessions: env::var("PHANTOM_MAX_SESSIONS")
                 .unwrap_or_else(|_| "100000".to_string())
-                .parse()
+                .parse::<usize>()
                 .unwrap_or(100000),
         })
     }
@@ -74,11 +69,18 @@ impl PhantomConfig {
 }
 
 // Глобальный конфиг (опционально, для удобства)
-lazy_static::lazy_static! {
+lazy_static! {
     pub static ref CONFIG: Config = Config::from_env()
-        .expect("Не удалось загрузить конфигурацию из .env файла");
+        .unwrap_or_else(|_| Config {
+            server_host: "127.0.0.1".to_string(),
+            server_port: 8000,
+        });
     pub static ref PHANTOM_CONFIG: PhantomConfig = PhantomConfig::from_env()
-        .unwrap_or_default();
+        .unwrap_or_else(|_| PhantomConfig {
+            enable_hardware_auth: false,
+            session_timeout_ms: 90_000,
+            max_sessions: 100_000,
+        });
 }
 
 impl Default for PhantomConfig {

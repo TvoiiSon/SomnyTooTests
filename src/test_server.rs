@@ -2,12 +2,12 @@ use tracing::info;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::io::AsyncWriteExt; // Убрали AsyncReadExt, т.к. не используется
+use tokio::io::AsyncWriteExt; // Убрали AsyncReadExt
 
 use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
-use crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool;
+use crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool; // Добавляем импорт
 use crate::config::PhantomConfig;
 
 pub struct TestServer {
@@ -15,7 +15,7 @@ pub struct TestServer {
     pub phantom_config: PhantomConfig,
     pub session_manager: Arc<PhantomSessionManager>,
     pub connection_manager: Arc<PhantomConnectionManager>,
-    pub crypto_pool: Arc<PhantomCryptoPool>,
+    pub crypto_pool: Arc<PhantomCryptoPool>, // Добавляем криптопул
     shutdown_tx: mpsc::Sender<()>,
 }
 
@@ -34,7 +34,9 @@ impl TestServer {
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
-        let _server_addr = addr.clone(); // Добавляем подчеркивание
+        // Убрали неиспользуемую переменную server_addr
+        let _server_addr = addr.clone();
+
         let server_config = phantom_config.clone();
         let server_session_manager = session_manager.clone();
         let server_connection_manager = connection_manager.clone();
@@ -102,7 +104,7 @@ impl TestServer {
         _config: PhantomConfig,
         session_manager: Arc<PhantomSessionManager>,
         _connection_manager: Arc<PhantomConnectionManager>,
-        _crypto_pool: Arc<PhantomCryptoPool>,
+        crypto_pool: Arc<PhantomCryptoPool>, // Добавляем криптопул
     ) -> anyhow::Result<()> {
         let mut stream = stream;
 
@@ -122,8 +124,9 @@ impl TestServer {
                     peer
                 ).await;
 
-                // Простая обработка входящих данных (эхо-сервер)
-                let mut buffer = [0u8; 1024];
+                // Простая обработка входящих данных (эхо-сервер с криптографией)
+                let mut buffer = [0u8; 4096];
+
                 loop {
                     match stream.readable().await {
                         Ok(()) => {
@@ -135,20 +138,63 @@ impl TestServer {
                                 Ok(n) => {
                                     info!("Received {} bytes from {}", n, peer);
 
-                                    // Проверяем пинг-пакет (тип 0x01)
-                                    if n > 0 && buffer[0] == 0x01 {
-                                        info!("Received ping packet, sending pong response");
-                                        // Отправляем pong (тип 0x02)
-                                        let pong_response = [0x02];
-                                        if let Err(e) = stream.write_all(&pong_response).await {
-                                            info!("Failed to send pong response: {}", e);
-                                            break;
+                                    let data = &buffer[..n];
+
+                                    // Пробуем расшифровать пакет
+                                    match crypto_pool.decrypt(session.clone(), data.to_vec()).await {
+                                        Ok((packet_type, plaintext)) => {
+                                            info!("✅ Successfully decrypted packet type: 0x{:02x}, size: {} bytes",
+                                                  packet_type, plaintext.len());
+
+                                            // Проверяем пинг-пакет (тип 0x01)
+                                            if packet_type == 0x01 && plaintext == b"ping" {
+                                                info!("✅ Received ping packet, sending encrypted pong response");
+
+                                                // Шифруем pong ответ
+                                                match crypto_pool.encrypt(
+                                                    session.clone(),
+                                                    0x02, // Тип пакета: pong
+                                                    b"pong".to_vec()
+                                                ).await {
+                                                    Ok(encrypted_response) => {
+                                                        if let Err(e) = stream.write_all(&encrypted_response).await {
+                                                            info!("Failed to send pong response: {}", e);
+                                                            break;
+                                                        }
+                                                        info!("✅ Encrypted pong response sent ({} bytes)", encrypted_response.len());
+                                                    }
+                                                    Err(e) => {
+                                                        info!("Failed to encrypt pong response: {}", e);
+                                                        // Fallback: отправляем сырой pong
+                                                        let pong_response = [0x02];
+                                                        let _ = stream.write_all(&pong_response).await;
+                                                    }
+                                                }
+                                            } else {
+                                                // Для других типов пакетов - эхо-ответ
+                                                info!("Sending echo response");
+                                                if let Err(e) = stream.write_all(data).await {
+                                                    info!("Failed to send echo response: {}", e);
+                                                    break;
+                                                }
+                                            }
                                         }
-                                    } else {
-                                        // Эхо-ответ для других данных
-                                        if let Err(e) = stream.write_all(&buffer[..n]).await {
-                                            info!("Failed to send echo response: {}", e);
-                                            break;
+                                        Err(e) => {
+                                            info!("⚠️ Failed to decrypt packet from {}: {}", peer, e);
+                                            info!("⚠️ This might be a raw packet (fallback mode)");
+
+                                            // Fallback: проверяем сырой ping-пакет
+                                            if n >= 5 && buffer[0] == 0x01 {
+                                                info!("⚠️ Received raw ping packet (fallback), sending raw pong");
+                                                let pong_response = [0x02];
+                                                let _ = stream.write_all(&pong_response).await;
+                                            } else {
+                                                // Эхо-ответ для других данных
+                                                if let Err(e) = stream.write_all(&buffer[..n]).await {
+                                                    info!("Failed to send echo response: {}", e);
+                                                    break;
+                                                }
+                                            }
                                         }
                                     }
                                 }

@@ -4,6 +4,23 @@ pub mod test_client;
 
 pub mod tests {
     pub mod send_ping_packet;
+    pub mod integrations;
+    pub mod improved_integration;
+
+    pub mod benchmarks {
+        pub mod crypto_bench;
+        pub mod handshake_bench;
+        pub mod throughput_bench;
+    }
+    pub mod helpers {
+        pub mod load_generator;
+        pub mod mock_components;
+        pub mod test_utils;
+    }
+    pub mod integration {
+        pub mod crypto_integrity;
+        pub mod error_handling;
+    }
 }
 
 // CORE
