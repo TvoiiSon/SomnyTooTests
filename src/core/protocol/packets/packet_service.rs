@@ -41,9 +41,6 @@ impl PhantomPacketService {
             0x01 => {
                 self.handle_ping(payload, session.clone(), client_ip).await?
             }
-            0x10 => {
-                self.handle_heartbeat(session.session_id(), client_ip).await?
-            }
             _ => {
                 self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?
             }
@@ -65,14 +62,15 @@ impl PhantomPacketService {
     async fn handle_ping(
         &self,
         payload: Vec<u8>,
-        session: Arc<PhantomSession>,
+        _session: Arc<PhantomSession>,
         client_ip: SocketAddr,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let start = Instant::now();
 
         info!("👻 Ping packet received from {}: {} ({} bytes)",
-              client_ip, String::from_utf8_lossy(&payload), payload.len());
+          client_ip, String::from_utf8_lossy(&payload), payload.len());
 
+        // ВАЖНОЕ ИЗМЕНЕНИЕ: Возвращаем PONG как payload для пакета типа 0x01
         let result = b"PONG".to_vec();
         let elapsed = start.elapsed();
 
@@ -81,24 +79,6 @@ impl PhantomPacketService {
         }
 
         Ok(result)
-    }
-
-    async fn handle_heartbeat(
-        &self,
-        session_id: &[u8],
-        client_ip: SocketAddr,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let start = Instant::now();
-
-        debug!("Processing phantom heartbeat from {} session: {}",
-              client_ip, hex::encode(session_id));
-
-        let heartbeat_result = b"Heartbeat acknowledged".to_vec();
-
-        let total_time = start.elapsed();
-        debug!("Phantom heartbeat processing: {:?}", total_time);
-
-        Ok(heartbeat_result)
     }
 
     async fn handle_unknown_packet(

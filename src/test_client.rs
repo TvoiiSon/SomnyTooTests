@@ -1,170 +1,88 @@
-use tracing::info;
-use anyhow::Result;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
-use tokio::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tracing::{info};
 
-use crate::core::protocol::phantom_crypto::{
-    core::{
-        keys::PhantomSession,
-        handshake::{perform_phantom_handshake, HandshakeRole},
-    },
-};
-use crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool; // Импортируем криптопул
-use crate::config::CONFIG;
+use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
+use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 
+/// Упрощенный тестовый клиент без packet_service
 pub struct TestClient {
     pub stream: TcpStream,
-    pub session: Arc<PhantomSession>,
-    pub crypto_pool: Arc<PhantomCryptoPool>, // Добавляем криптопул
+    pub session: Arc<crate::core::protocol::phantom_crypto::core::keys::PhantomSession>,
+    pub packet_processor: PhantomPacketProcessor,
 }
 
 impl TestClient {
-    pub async fn connect() -> Result<Self> {
-        let mut stream = TcpStream::connect(CONFIG.server_addr()).await?;
-        info!(target: "test", "Client connected to {}", CONFIG.server_addr());
+    pub async fn connect(server_addr: &str) -> anyhow::Result<Self> {
+        info!("🔗 Test client connecting to {}...", server_addr);
 
-        // Используем фантомный handshake
-        let handshake_result = perform_phantom_handshake(&mut stream, HandshakeRole::Client).await
-            .map_err(|e| anyhow::anyhow!("Phantom handshake failed: {:?}", e))?;
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            TcpStream::connect(server_addr)
+        ).await??;
 
-        info!(target: "test", "Phantom handshake completed, session_id: {}",
-              hex::encode(handshake_result.session.session_id()));
+        info!("✅ Connected to server");
 
-        // Создаем криптопул для клиента
-        let crypto_pool = Arc::new(PhantomCryptoPool::spawn(4)); // 4 воркера для тестов
+        // Выполняем handshake
+        let handshake_result = perform_phantom_handshake(&mut stream, HandshakeRole::Client).await?;
+        let session = Arc::new(handshake_result.session);
 
-        Ok(Self {
-            stream,
-            session: Arc::new(handshake_result.session),
-            crypto_pool,
-        })
-    }
-
-    /// Подключение к конкретному адресу (для тестового сервера)
-    pub async fn connect_to(addr: &str) -> Result<Self> {
-        let mut stream = TcpStream::connect(addr).await?;
-        info!(target: "test", "Client connected to {}", addr);
-
-        // Используем фантомный handshake
-        let handshake_result = perform_phantom_handshake(&mut stream, HandshakeRole::Client).await
-            .map_err(|e| anyhow::anyhow!("Phantom handshake failed: {:?}", e))?;
-
-        info!(target: "test", "Phantom handshake completed, session_id: {}",
-              hex::encode(handshake_result.session.session_id()));
-
-        // Создаем криптопул для клиента
-        let crypto_pool = Arc::new(PhantomCryptoPool::spawn(4));
+        info!("✅ Handshake completed. Session ID: {}", hex::encode(session.session_id()));
 
         Ok(Self {
             stream,
-            session: Arc::new(handshake_result.session),
-            crypto_pool,
+            session,
+            packet_processor: PhantomPacketProcessor::new(),
         })
     }
 
-    pub async fn send_ping(&mut self) -> Result<()> {
-        // Создаем ping данные
-        let ping_data = b"ping";
+    pub async fn send_ping(&mut self) -> anyhow::Result<()> {
+        let packet_data = self.packet_processor.create_outgoing_vec(
+            &self.session,
+            0x01, // PING packet type
+            b"Test PING from client"
+        )?;
 
-        info!(target: "test", "Encrypting ping packet with session: {}",
-              hex::encode(self.session.session_id()));
+        crate::core::protocol::packets::frame_writer::write_frame(
+            &mut self.stream,
+            &packet_data
+        ).await?;
 
-        // Шифруем через криптопул
-        match self.crypto_pool.encrypt(
-            self.session.clone(),
-            0x01, // Тип пакета: ping
-            ping_data.to_vec()
-        ).await {
-            Ok(encrypted_packet) => {
-                info!(target: "test", "✅ Ping packet encrypted, size: {} bytes", encrypted_packet.len());
-
-                // Отправляем зашифрованный пакет
-                self.stream.write_all(&encrypted_packet).await?;
-                info!(target: "test", "✅ Encrypted ping packet sent");
-
-                Ok(())
-            }
-            Err(e) => {
-                info!(target: "test", "❌ Failed to encrypt ping packet: {}", e);
-
-                // Fallback: отправляем сырой пакет для совместимости
-                let mut packet = vec![0x01]; // Тип пакета: данные
-                packet.extend_from_slice(ping_data);
-
-                self.stream.write_all(&packet).await?;
-                info!(target: "test", "⚠️  Sent raw ping packet (fallback), size: {} bytes", packet.len());
-
-                Ok(())
-            }
-        }
-    }
-
-    pub async fn receive_response(&mut self) -> Result<Vec<u8>> {
-        let mut buffer = vec![0u8; 4096];
-        match self.stream.read(&mut buffer).await {
-            Ok(0) => {
-                info!("Connection closed by server");
-                Ok(Vec::new())
-            }
-            Ok(n) => {
-                buffer.truncate(n);
-                info!("Received {} bytes from server", n);
-
-                // Пробуем расшифровать ответ
-                if n > 50 { // Если пакет достаточно большой, пробуем расшифровать
-                    match self.crypto_pool.decrypt(self.session.clone(), buffer.clone()).await {
-                        Ok((packet_type, plaintext)) => {
-                            info!("✅ Successfully decrypted response: type=0x{:02x}, size={} bytes",
-                                  packet_type, plaintext.len());
-                            Ok(plaintext)
-                        }
-                        Err(e) => {
-                            info!("⚠️  Could not decrypt response ({}), returning raw data", e);
-                            Ok(buffer)
-                        }
-                    }
-                } else {
-                    Ok(buffer)
-                }
-            }
-            Err(e) => Err(anyhow::anyhow!("Failed to read from server: {}", e)),
-        }
-    }
-
-    pub async fn shutdown(&mut self) -> Result<()> {
-        self.stream.shutdown().await?;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        info!("🏓 Test PING sent");
         Ok(())
     }
-}
 
-// Простая функция для тестирования без полной фантомной системы
-pub async fn test_phantom_connection() -> Result<()> {
-    info!("Testing phantom connection...");
+    pub async fn send_custom_packet(&mut self, packet_type: u8, data: &[u8]) -> anyhow::Result<()> {
+        let packet_data = self.packet_processor.create_outgoing_vec(
+            &self.session,
+            packet_type,
+            data
+        )?;
 
-    let mut client = TestClient::connect().await?;
-    info!("Connected successfully");
+        crate::core::protocol::packets::frame_writer::write_frame(
+            &mut self.stream,
+            &packet_data
+        ).await?;
 
-    // Отправляем тестовый пинг
-    client.send_ping().await?;
-
-    // Ждем ответ (таймаут 5 секунд)
-    match tokio::time::timeout(Duration::from_secs(5), client.receive_response()).await {
-        Ok(Ok(response)) => {
-            info!("Received response: {} bytes", response.len());
-        }
-        Ok(Err(e)) => {
-            info!("Error receiving response: {}", e);
-        }
-        Err(_) => {
-            info!("Timeout waiting for response");
-        }
+        info!("📤 Custom packet 0x{:02X} sent ({} bytes)", packet_type, data.len());
+        Ok(())
     }
 
-    client.shutdown().await?;
-    info!("Test completed");
+    pub async fn receive_packet(&mut self) -> anyhow::Result<Option<(u8, Vec<u8>)>> {
+        let frame_data = crate::core::protocol::packets::frame_reader::read_frame(
+            &mut self.stream
+        ).await?;
 
-    Ok(())
+        if frame_data.is_empty() {
+            return Ok(None);
+        }
+
+        let (packet_type, decrypted_data) = self.packet_processor.process_incoming_vec(
+            &frame_data,
+            &self.session
+        )?;
+
+        Ok(Some((packet_type, decrypted_data)))
+    }
 }

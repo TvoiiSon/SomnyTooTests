@@ -1,53 +1,24 @@
-use dotenv::dotenv;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use anyhow::Result;
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
-use clap::{Parser, Subcommand};
+use tracing::{info, error, warn};
 
-use somnytoo_test::tests::integrations::IntegrationTestRunner;
-use somnytoo_test::tests::improved_integration::ImprovedIntegrationTestRunner;
+use somnytoo_test::config::CLIENT_CONFIG;
+use somnytoo_test::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
+use somnytoo_test::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 
-/// CLI для запуска тестов
-#[derive(Parser)]
-#[command(name = "SomnyTooTests")]
-#[command(about = "Клиент для тестирования SomnyToo сервера", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
+// Импортируем batch компоненты
+use somnytoo_test::core::protocol::phantom_crypto::batch::{
+    io::writer::batch_writer::{BatchWriter, BatchWriterConfig},
+};
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Запустить все интеграционные тесты
-    Test,
-
-    /// Запустить улучшенные интеграционные тесты
-    TestImproved,
-
-    /// Запустить все тесты (обычные + улучшенные)
-    TestAll,
-
-    /// Запустить определенный тест
-    Run {
-        /// Название теста
-        test_name: String,
-    },
-
-    /// Запустить нагрузочный тест
-    LoadTest {
-        /// Количество клиентов
-        #[arg(default_value_t = 10)]
-        clients: usize,
-
-        /// Максимум параллельных подключений
-        #[arg(default_value_t = 3)]
-        concurrent: usize,
-    },
-}
+use somnytoo_test::tests::ping_sender::{start_ping_sender_task, test_packet_creation};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    dotenv().ok();
-
-    // Инициализация логирования
+async fn main() -> Result<()> {
+    // Настройка логирования
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -55,347 +26,237 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(filter)
         .with_target(true)
         .with_level(true)
-        .with_ansi(true)
         .finish();
 
     tracing::subscriber::set_global_default(subscriber)
-        .expect("Не удалось установить логгер");
+        .expect("setting default subscriber failed");
 
-    let cli = Cli::parse();
+    info!("🚀 Starting Phantom Protocol Client with Batch System...");
 
-    match cli.command {
-        Commands::Test => {
-            run_legacy_tests().await?;
+    info!("📝 Configuration:");
+    info!("  - Server: {}", CLIENT_CONFIG.server_addr());
+    info!("  - Timeout: {}ms", CLIENT_CONFIG.connect_timeout_ms);
+
+    // Запуск клиента с batch системой
+    run_client_with_batch().await
+}
+
+async fn run_client_with_batch() -> Result<()> {
+    let addr = CLIENT_CONFIG.server_addr();
+    let server_addr_parsed = addr.parse()?;
+
+    info!("🔗 Connecting to server at {}...", addr);
+
+    // Подключение к серверу
+    let stream = tokio::time::timeout(
+        Duration::from_millis(CLIENT_CONFIG.connect_timeout_ms),
+        TcpStream::connect(&addr)
+    ).await??;
+
+    info!("✅ Connected to server");
+
+    // Для handshake нужен &mut, создаем копию потока через into_split
+    info!("🤝 Performing phantom handshake...");
+
+    // Делаем handshake НА ОРИГИНАЛЬНОМ потоке
+    let mut stream_for_handshake = stream;
+    let handshake_result = perform_phantom_handshake(
+        &mut stream_for_handshake,
+        HandshakeRole::Client
+    ).await?;
+
+    // Ждем 100ms чтобы сервер успел запустить BatchReader
+    info!("⏳ Waiting for server BatchReader to initialize...");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    info!("🚀 Starting to send packets...");
+
+    let session = Arc::new(handshake_result.session);
+    let session_id = session.session_id();
+    let session_id_bytes = session_id.to_vec();
+
+    info!("✅ Handshake completed! Session ID: {}", hex::encode(session_id));
+    info!("🕐 Handshake time: {:?}", handshake_result.handshake_time);
+
+    // ТЕСТ: Проверяем создание пакета
+    info!("🧪 Testing packet creation...");
+    if let Err(e) = test_packet_creation(&session) {
+        error!("❌ Packet creation test failed: {}", e);
+        return Err(e);
+    }
+
+    // Теперь у нас есть stream_for_handshake, который мы будем использовать для всего
+    let stream = stream_for_handshake;
+
+    // Инициализируем batch систему
+    info!("🚀 Initializing client batch system...");
+
+    // Создаем BatchWriter
+    let writer_config = BatchWriterConfig {
+        batch_size: 1,
+        max_batch_size: 64,
+        flush_interval_ms: 100,
+        max_buffer_size: 1024 * 1024,
+        write_timeout_ms: 5000,
+        retry_count: 3,
+        retry_delay_ms: 100,
+    };
+
+    let (batch_writer, mut writer_events_rx) = BatchWriter::new(writer_config);
+    let batch_writer = Arc::new(batch_writer);
+
+    // Регистрируем соединение в BatchWriter
+    info!("📤 Registering connection with BatchWriter...");
+
+    // Создаем обертку для потока, которая реализует AsyncWrite
+    struct TcpStreamWriter(tokio::net::tcp::OwnedWriteHalf);
+
+    impl tokio::io::AsyncWrite for TcpStreamWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
         }
-        Commands::TestImproved => {
-            run_improved_tests().await?;
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
         }
-        Commands::TestAll => {
-            run_all_test_suites().await?;
-        }
-        Commands::Run { test_name } => {
-            run_single_test(&test_name).await?;
-        }
-        Commands::LoadTest { clients, concurrent } => {
-            run_load_test(clients, concurrent).await?;
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
         }
     }
 
+    // Разделяем поток на чтение и запись
+    let (stream_for_reader, stream_for_writer) = stream.into_split();
+
+    match batch_writer.register_connection(
+        server_addr_parsed,
+        session_id_bytes.clone(),
+        Box::new(TcpStreamWriter(stream_for_writer)),
+    ).await {
+        Ok(_) => info!("✅ Connection registered with BatchWriter"),
+        Err(e) => {
+            error!("❌ Failed to register connection with BatchWriter: {}", e);
+            return Err(e.into());
+        }
+    }
+
+    // Запускаем задачу для обработки событий BatchWriter
+    let batch_writer_events_task = tokio::spawn(async move {
+        while let Some(event) = writer_events_rx.recv().await {
+            match event {
+                somnytoo_test::core::protocol::phantom_crypto::batch::io::writer::batch_writer::BatchWriterEvent::WriteCompleted {
+                    destination_addr,
+                    batch_id,
+                    bytes_written,
+                    write_time,
+                } => {
+                    info!("📤 Batch #{} sent to {}: {} bytes in {:?}",
+                          batch_id, destination_addr, bytes_written, write_time);
+                }
+                _ => {} // Игнорируем другие события
+            }
+        }
+    });
+
+    // Запускаем ДВЕ задачи параллельно:
+    // 1. Чтение ответов от сервера
+    // 2. Отправка пакетов через PingSender
+
+    let batch_writer_clone = Arc::clone(&batch_writer);
+    let session_clone = Arc::clone(&session);
+
+    // Задача для отправки PING пакетов (используем PingSender)
+    let send_task = tokio::spawn(async move {
+        info!("🎯 Starting ping sender task...");
+
+        if let Err(e) = start_ping_sender_task(
+            batch_writer_clone,
+            session_clone,
+            server_addr_parsed,
+            3, // количество пакетов
+            2000, // интервал 2 секунды
+        ).await {
+            error!("❌ Ping sender task failed: {}", e);
+        }
+    });
+
+    // Задача для чтения ответов
+    let read_task = tokio::spawn(async move {
+        if let Err(e) = handle_server_responses(stream_for_reader, session).await {
+            warn!("📭 Server response handler error: {}", e);
+        }
+    });
+
+    // Ждем завершения задач отправки и чтения
+    let (send_result, read_result, _) = tokio::join!(send_task, read_task, batch_writer_events_task);
+
+    if let Err(e) = send_result {
+        error!("❌ Send task failed: {}", e);
+    }
+
+    if let Err(e) = read_result {
+        error!("❌ Read task failed: {}", e);
+    }
+
+    info!("👋 Client shutdown complete");
     Ok(())
 }
 
-async fn run_legacy_tests() -> anyhow::Result<()> {
-    println!("========================================");
-    println!("   БАЗОВОЕ ИНТЕГРАЦИОННОЕ ТЕСТИРОВАНИЕ");
-    println!("========================================\n");
+async fn handle_server_responses(
+    mut stream: tokio::net::tcp::OwnedReadHalf,
+    session: Arc<somnytoo_test::core::protocol::phantom_crypto::core::keys::PhantomSession>,
+) -> Result<()> {
+    info!("👂 Listening for server responses...");
 
-    let mut runner = IntegrationTestRunner::new();
-    let success = runner.run_all_tests().await;
+    let packet_processor = PhantomPacketProcessor::new();
 
-    if success {
-        println!("\n🎉 ВСЕ БАЗОВЫЕ ТЕСТЫ ПРОЙДЕНЫ УСПЕШНО!");
-        Ok(())
-    } else {
-        println!("\n⚠️  НЕКОТОРЫЕ БАЗОВЫЕ ТЕСТЫ НЕ ПРОЙДЕНЫ!");
-        Err(anyhow::anyhow!("Базовое тестирование завершилось с ошибками"))
-    }
-}
+    loop {
+        // Читаем фреймы от сервера с таймаутом
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            somnytoo_test::core::protocol::packets::frame_reader::read_frame(&mut stream)
+        ).await {
+            Ok(Ok(frame_data)) => {
+                if frame_data.is_empty() {
+                    info!("📭 Server closed connection (empty frame)");
+                    break;
+                }
 
-async fn run_improved_tests() -> anyhow::Result<()> {
-    println!("========================================");
-    println!("   УЛУЧШЕННОЕ ИНТЕГРАЦИОННОЕ ТЕСТИРОВАНИЕ");
-    println!("========================================\n");
-
-    let mut runner = ImprovedIntegrationTestRunner::new();
-    let success = runner.run_all_tests().await;
-
-    if success {
-        println!("\n🎉 ВСЕ УЛУЧШЕННЫЕ ТЕСТЫ ПРОЙДЕНЫ УСПЕШНО!");
-        Ok(())
-    } else {
-        println!("\n⚠️  НЕКОТОРЫЕ УЛУЧШЕННЫЕ ТЕСТЫ НЕ ПРОЙДЕНЫ!");
-        Err(anyhow::anyhow!("Улучшенное тестирование завершилось с ошибками"))
-    }
-}
-
-async fn run_all_test_suites() -> anyhow::Result<()> {
-    println!("========================================");
-    println!("   ПОЛНОЕ ТЕСТИРОВАНИЕ СИСТЕМЫ");
-    println!("========================================\n");
-
-    let mut all_success = true;
-
-    // Запускаем базовые тесты
-    println!("1. Запуск базовых тестов...");
-    match run_legacy_tests().await {
-        Ok(_) => println!("✅ Базовые тесты пройдены\n"),
-        Err(e) => {
-            println!("❌ Ошибка базовых тестов: {}", e);
-            all_success = false;
+                // Обрабатываем пакет
+                match packet_processor.process_incoming_vec(&frame_data, &session) {
+                    Ok((packet_type, payload)) => {
+                        match packet_type {
+                            0x01 => info!("🏓 PONG received from server: {}", String::from_utf8_lossy(&payload)),
+                            _ => info!("📥 Packet 0x{:02X} received from server: {} bytes",
+                                      packet_type, payload.len()),
+                        }
+                    }
+                    Err(e) => {
+                        warn!("❌ Failed to process server packet: {}", e);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                info!("📭 Connection error: {}", e);
+                break;
+            }
+            Err(_) => {
+                warn!("⏰ Read timeout after 30 seconds");
+                break;
+            }
         }
     }
 
-    // Запускаем улучшенные тесты
-    println!("2. Запуск улучшенных тестов...");
-    match run_improved_tests().await {
-        Ok(_) => println!("✅ Улучшенные тесты пройдены\n"),
-        Err(e) => {
-            println!("❌ Ошибка улучшенных тестов: {}", e);
-            all_success = false;
-        }
-    }
-
-    if all_success {
-        println!("========================================");
-        println!("🎉 ВСЕ ТЕСТЫ СИСТЕМЫ ПРОЙДЕНЫ УСПЕШНО!");
-        println!("========================================");
-        Ok(())
-    } else {
-        println!("========================================");
-        println!("⚠️  НЕКОТОРЫЕ ТЕСТЫ СИСТЕМЫ НЕ ПРОЙДЕНЫ!");
-        println!("========================================");
-        Err(anyhow::anyhow!("Полное тестирование завершилось с ошибками"))
-    }
-}
-
-async fn run_single_test(test_name: &str) -> anyhow::Result<()> {
-    println!("Запуск теста: {}", test_name);
-
-    // Сначала проверяем базовые тесты
-    match test_name {
-        // Базовые тесты
-        "basic_connection" => {
-            let task = IntegrationTestRunner::test_basic_connection();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        "ping_pong" => {
-            let task = IntegrationTestRunner::test_ping_pong();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        "multiple_connections" => {
-            let task = IntegrationTestRunner::test_multiple_connections();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        "connection_timeout" => {
-            let task = IntegrationTestRunner::test_connection_timeout();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        "rapid_reconnect" => {
-            let task = IntegrationTestRunner::test_rapid_reconnect();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        // Улучшенные тесты
-        "improved_basic_connection" => {
-            let task = ImprovedIntegrationTestRunner::test_improved_basic_connection();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        "encrypted_ping_pong" => {
-            let task = ImprovedIntegrationTestRunner::test_encrypted_ping_pong();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        "session_persistence" => {
-            let task = ImprovedIntegrationTestRunner::test_session_persistence();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        "connection_timeout_fixed" => {
-            let task = ImprovedIntegrationTestRunner::test_connection_timeout_fixed();
-            match task.await {
-                Ok(Ok(_)) => println!("✅ Тест пройден успешно!"),
-                Ok(Err(e)) => {
-                    println!("❌ Ошибка теста: {}", e);
-                    return Err(e);
-                }
-                Err(e) => {
-                    println!("❌ Ошибка выполнения: {}", e);
-                    return Err(anyhow::anyhow!("Ошибка выполнения: {}", e));
-                }
-            }
-        }
-        _ => {
-            println!("❌ Неизвестный тест: {}", test_name);
-            println!("Доступные тесты:");
-            println!("\nБазовые тесты:");
-            println!("  basic_connection     - Базовое подключение");
-            println!("  ping_pong           - Ping-Pong тест");
-            println!("  multiple_connections - Множественные подключения");
-            println!("  connection_timeout  - Таймаут подключения");
-            println!("  rapid_reconnect     - Быстрое переподключение");
-            println!("\nУлучшенные тесты:");
-            println!("  improved_basic_connection - Улучшенное базовое подключение");
-            println!("  encrypted_ping_pong      - Зашифрованный ping-pong");
-            println!("  session_persistence      - Сохранение состояния сессии");
-            println!("  connection_timeout_fixed - Таймаут подключения (исправленный)");
-            return Ok(());
-        }
-    }
-
-    println!("✅ Тест '{}' пройден успешно!", test_name);
+    info!("📭 Read task completed");
     Ok(())
-}
-
-async fn run_load_test(clients: usize, concurrent: usize) -> anyhow::Result<()> {
-    use tokio::sync::Semaphore;
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    println!("========================================");
-    println!("   НАГРУЗОЧНОЕ ТЕСТИРОВАНИЕ");
-    println!("========================================\n");
-    println!("Клиентов: {}", clients);
-    println!("Параллельно: {}", concurrent);
-    println!();
-
-    let server = somnytoo_test::test_server::TestServer::spawn().await;
-    println!("✅ Сервер запущен");
-
-    let semaphore = Arc::new(Semaphore::new(concurrent));
-    let mut tasks = Vec::new();
-    let start_time = Instant::now();
-
-    println!("🔄 Запуск клиентов...");
-
-    for client_id in 0..clients {
-        let semaphore = Arc::clone(&semaphore);
-
-        tasks.push(tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.unwrap();
-
-            match somnytoo_test::test_client::TestClient::connect().await {
-                Ok(mut client) => {
-                    let _ = client.send_ping().await;
-                    let _ = client.receive_response().await;
-                    let _ = client.shutdown().await;
-                    Some(client_id)
-                }
-                Err(_) => None,
-            }
-        }));
-
-        // Небольшая задержка между запуском клиентов
-        if client_id < clients - 1 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    // Ждем завершения всех задач
-    let mut successful = 0;
-    let mut failed = 0;
-
-    for task in tasks {
-        match task.await {
-            Ok(Some(_)) => successful += 1,
-            Ok(None) => failed += 1,
-            Err(_) => failed += 1,
-        }
-    }
-
-    let total_time = start_time.elapsed();
-
-    println!("\n📊 РЕЗУЛЬТАТЫ НАГРУЗОЧНОГО ТЕСТА:");
-    println!("  Всего клиентов: {}", clients);
-    println!("  Успешно: {}", successful);
-    println!("  Неудачно: {}", failed);
-    println!("  Общее время: {:?}", total_time);
-
-    if successful > 0 {
-        let avg_time = total_time / successful as u32;
-        println!("  Среднее время на клиента: {:?}", avg_time);
-        println!("  Клиентов в секунду: {:.1}",
-                 successful as f64 / total_time.as_secs_f64());
-    }
-
-    let success_rate = successful as f64 / clients as f64 * 100.0;
-    println!("  Успешность: {:.1}%", success_rate);
-
-    // Останавливаем сервер
-    server.stop().await;
-    println!("\n✅ Сервер остановлен");
-
-    if success_rate >= 90.0 {
-        println!("\n🎉 Нагрузочный тест пройден успешно!");
-        Ok(())
-    } else {
-        println!("\n⚠️  Нагрузочный тест не пройден (успешность < 90%)");
-        Err(anyhow::anyhow!("Низкая успешность нагрузочного теста"))
-    }
 }
