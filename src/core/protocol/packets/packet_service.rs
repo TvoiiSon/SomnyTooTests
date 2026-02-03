@@ -4,26 +4,18 @@ use tracing::{info, error, debug};
 use std::time::{Instant, Duration};
 
 use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
-use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 
 pub struct PacketProcessingResult {
     pub response: Vec<u8>,
     pub should_encrypt: bool,
     pub packet_type: u8,
-    pub priority: crate::core::protocol::phantom_crypto::batch::types::priority::Priority,
 }
 
-pub struct PhantomPacketService {
-    phantom_session_manager: Arc<PhantomSessionManager>,
-}
+pub struct PhantomPacketService;
 
 impl PhantomPacketService {
-    pub fn new(
-        phantom_session_manager: Arc<PhantomSessionManager>,
-    ) -> Self {
-        Self {
-            phantom_session_manager,
-        }
+    pub fn new() -> Self {
+        Self {}
     }
 
     pub async fn process_packet(
@@ -38,21 +30,15 @@ impl PhantomPacketService {
         debug!("Processing phantom packet type: 0x{:02X} from {}, session: {}",
               packet_type, client_ip, hex::encode(session.session_id()));
 
-        let (response_data, priority) = match packet_type {
+        let response_data = match packet_type {
             0x01 => {
-                let response = self.handle_ping(payload, session.clone(), client_ip).await?;
-                // PING/PONG пакеты имеют критический приоритет для быстрого ответа
-                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::Critical)
+                self.handle_ping(payload, session.clone(), client_ip).await?
             }
             0x10 => {
-                let response = self.handle_heartbeat(session.session_id(), client_ip).await?;
-                // Heartbeat пакеты имеют высокий приоритет
-                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::High)
+                self.handle_heartbeat(session.session_id(), client_ip).await?
             }
             _ => {
-                let response = self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?;
-                // Неизвестные пакеты имеют нормальный приоритет
-                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::Normal)
+                self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?
             }
         };
 
@@ -66,7 +52,6 @@ impl PhantomPacketService {
             response: response_data,
             should_encrypt: true,
             packet_type,
-            priority,
         })
     }
 
@@ -81,8 +66,7 @@ impl PhantomPacketService {
         info!("👻 Ping packet received from {}: {} ({} bytes)",
         client_ip, String::from_utf8_lossy(&payload), payload.len());
 
-        // ВАЖНО: Возвращаем PONG как plaintext payload
-        // Клиент ожидает ответ с тем же packet_type (0x01), но с другим содержимым
+        // Клиент получает PING - отправляем PONG обратно
         let result = b"PONG".to_vec();
 
         let elapsed = start.elapsed();
@@ -128,8 +112,6 @@ impl PhantomPacketService {
 
 impl Clone for PhantomPacketService {
     fn clone(&self) -> Self {
-        Self {
-            phantom_session_manager: Arc::clone(&self.phantom_session_manager),
-        }
+        Self {}
     }
 }

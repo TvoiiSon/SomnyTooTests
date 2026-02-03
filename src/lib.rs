@@ -23,34 +23,11 @@ pub mod core {
             pub mod runtime {
                 pub mod runtime;
             }
-            pub mod batch {
-                pub mod core {
-                    pub mod reader;
-                    pub mod writer;
-                    pub mod dispatcher;
-                    pub mod processor;
-                    pub mod buffer;
-                }
-                pub mod types {
-                    pub mod priority;
-                    pub mod error;
-                    pub mod result;
-                    pub mod state;
-                }
-
-                pub mod config;
-                pub mod integration;
-            }
         }
         pub mod packets {
             pub mod packet_service;
             pub mod frame_reader;
             pub mod frame_writer;
-        }
-        pub mod server {
-            pub mod tcp_server_phantom;
-            pub mod session_manager_phantom;
-            pub mod connection_manager_phantom;
         }
     }
 }

@@ -1,5 +1,4 @@
 use std::time::Instant;
-use std::sync::Arc;
 use tracing::{warn, info, debug};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -8,7 +7,6 @@ use crate::core::protocol::phantom_crypto::{
         chacha20_accel::{ChaCha20Accelerator, CpuCapabilities},
         blake3_accel::Blake3Accelerator,
     },
-    batch::core::processor::CryptoProcessor
 };
 
 /// Время выполнения в тактах процессора
@@ -28,7 +26,6 @@ pub struct RuntimeStats {
     pub timing_anomalies: u64,
     pub cycles: ExecutionCycles,
     pub avg_execution_time_ns: u64,
-    pub batch_operations: u64,
     pub simd_operations: u64,
 }
 
@@ -36,19 +33,14 @@ pub struct RuntimeStats {
 pub struct PhantomRuntime {
     chacha20_accel: ChaCha20Accelerator,
     blake3_accel: Blake3Accelerator,
-    batch_processor: Arc<CryptoProcessor>,  // Измененный тип
     stats: std::sync::Mutex<RuntimeStats>,
     cpu_caps: CpuCapabilities,
 }
 
 impl PhantomRuntime {
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new() -> Self {
         let chacha20_accel = ChaCha20Accelerator::new();
         let blake3_accel = Blake3Accelerator::new();
-        let batch_processor = Arc::new(CryptoProcessor::new(
-            crate::core::protocol::phantom_crypto::batch::config::BatchConfig::default()
-        ));
-
         let cpu_caps = CpuCapabilities::detect();
 
         info!("PhantomRuntime initialized with:");
@@ -56,12 +48,10 @@ impl PhantomRuntime {
         info!("  - AVX512: {}", cpu_caps.avx512);
         info!("  - NEON: {}", cpu_caps.neon);
         info!("  - AES-NI: {}", cpu_caps.aes_ni);
-        info!("  - Workers: {}", num_workers);
 
         Self {
             chacha20_accel,
             blake3_accel,
-            batch_processor,
             stats: std::sync::Mutex::new(RuntimeStats {
                 total_operations: 0,
                 failed_operations: 0,
@@ -73,7 +63,6 @@ impl PhantomRuntime {
                     last: 0,
                 },
                 avg_execution_time_ns: 0,
-                batch_operations: 0,
                 simd_operations: 0,
             }),
             cpu_caps,
@@ -86,10 +75,6 @@ impl PhantomRuntime {
 
     pub fn blake3_accelerator(&self) -> &Blake3Accelerator {
         &self.blake3_accel
-    }
-
-    pub fn batch_processor(&self) -> Arc<CryptoProcessor> {
-        self.batch_processor.clone()
     }
 
     pub fn cpu_capabilities(&self) -> &CpuCapabilities {
@@ -133,7 +118,7 @@ impl PhantomRuntime {
         Ok(result)
     }
 
-    /// Batch операция
+    /// Batch операция (упрощенная версия)
     pub fn execute_batch<F, T>(&self, operations: Vec<F>) -> Vec<Result<T, String>>
     where
         F: FnOnce(&ChaCha20Accelerator, &Blake3Accelerator) -> T + Send,
@@ -150,9 +135,8 @@ impl PhantomRuntime {
 
         let elapsed = start.elapsed();
 
-        // Обновляем batch статистику
+        // Обновляем статистику
         let mut stats = self.stats.lock().unwrap();
-        stats.batch_operations += results.len() as u64;
         stats.total_operations += results.len() as u64;
 
         debug!("Batch execution completed in {:?} for {} operations",
@@ -219,18 +203,11 @@ impl PhantomRuntime {
             0.0
         };
 
-        let batch_percentage = if stats.total_operations > 0 {
-            (stats.batch_operations as f64 / stats.total_operations as f64) * 100.0
-        } else {
-            0.0
-        };
-
         format!(
-            "Operations: {}, Failed: {}, SIMD: {:.1}%, Batch: {:.1}%, Avg time: {}ns",
+            "Operations: {}, Failed: {}, SIMD: {:.1}%, Avg time: {}ns",
             stats.total_operations,
             stats.failed_operations,
             simd_percentage,
-            batch_percentage,
             stats.avg_execution_time_ns
         )
     }
@@ -238,10 +215,6 @@ impl PhantomRuntime {
 
 impl Default for PhantomRuntime {
     fn default() -> Self {
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-
-        Self::new(num_workers)
+        Self::new()
     }
 }
