@@ -29,6 +29,8 @@ chacha20 = "0.9"
 chacha20poly1305 = "0.10"
 blake3 = "1.8"
 rayon = "1.11"
+chrono = "0.4.43"
+clap = { version = "4.5.56", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["full", "test-util"] }
