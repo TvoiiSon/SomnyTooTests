@@ -10,6 +10,7 @@ pub struct PacketProcessingResult {
     pub response: Vec<u8>,
     pub should_encrypt: bool,
     pub packet_type: u8,
+    pub priority: crate::core::protocol::phantom_crypto::batch::types::priority::Priority,
 }
 
 pub struct PhantomPacketService {
@@ -37,12 +38,21 @@ impl PhantomPacketService {
         debug!("Processing phantom packet type: 0x{:02X} from {}, session: {}",
               packet_type, client_ip, hex::encode(session.session_id()));
 
-        let response_data = match packet_type {
+        let (response_data, priority) = match packet_type {
             0x01 => {
-                self.handle_ping(payload, session.clone(), client_ip).await?
+                let response = self.handle_ping(payload, session.clone(), client_ip).await?;
+                // PING/PONG пакеты имеют критический приоритет для быстрого ответа
+                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::Critical)
+            }
+            0x10 => {
+                let response = self.handle_heartbeat(session.session_id(), client_ip).await?;
+                // Heartbeat пакеты имеют высокий приоритет
+                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::High)
             }
             _ => {
-                self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?
+                let response = self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?;
+                // Неизвестные пакеты имеют нормальный приоритет
+                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::Normal)
             }
         };
 
@@ -56,6 +66,7 @@ impl PhantomPacketService {
             response: response_data,
             should_encrypt: true,
             packet_type,
+            priority,
         })
     }
 
@@ -68,10 +79,12 @@ impl PhantomPacketService {
         let start = Instant::now();
 
         info!("👻 Ping packet received from {}: {} ({} bytes)",
-          client_ip, String::from_utf8_lossy(&payload), payload.len());
+        client_ip, String::from_utf8_lossy(&payload), payload.len());
 
-        // ВАЖНОЕ ИЗМЕНЕНИЕ: Возвращаем PONG как payload для пакета типа 0x01
+        // ВАЖНО: Возвращаем PONG как plaintext payload
+        // Клиент ожидает ответ с тем же packet_type (0x01), но с другим содержимым
         let result = b"PONG".to_vec();
+
         let elapsed = start.elapsed();
 
         if elapsed > Duration::from_millis(1) {
@@ -79,6 +92,24 @@ impl PhantomPacketService {
         }
 
         Ok(result)
+    }
+
+    async fn handle_heartbeat(
+        &self,
+        session_id: &[u8],
+        client_ip: SocketAddr,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let start = Instant::now();
+
+        debug!("Processing phantom heartbeat from {} session: {}",
+              client_ip, hex::encode(session_id));
+
+        let heartbeat_result = b"Heartbeat acknowledged".to_vec();
+
+        let total_time = start.elapsed();
+        debug!("Phantom heartbeat processing: {:?}", total_time);
+
+        Ok(heartbeat_result)
     }
 
     async fn handle_unknown_packet(

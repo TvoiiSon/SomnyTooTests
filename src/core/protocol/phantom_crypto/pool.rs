@@ -6,10 +6,15 @@ pub struct PhantomCryptoPool {
 }
 
 impl PhantomCryptoPool {
-    pub fn new() -> Self {
-        Self {
-            crypto_instances: vec![Arc::new(PhantomCrypto::new())],
+    pub fn spawn(num_workers: usize, crypto: Arc<PhantomCrypto>) -> Arc<Self> {
+        let mut instances = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            instances.push(crypto.clone());
         }
+
+        Arc::new(Self {
+            crypto_instances: instances,
+        })
     }
 
     pub fn get_instance(&self, index: usize) -> Option<Arc<PhantomCrypto>> {

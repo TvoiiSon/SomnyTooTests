@@ -8,3 +8,4 @@ pub mod acceleration;
 pub mod core;
 pub mod memory;
 pub mod runtime;
+pub mod batch;

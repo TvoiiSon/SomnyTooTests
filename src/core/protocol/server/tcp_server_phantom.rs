@@ -5,76 +5,71 @@ use tokio::time::timeout;
 use tracing::{info, error};
 
 use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
-use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
+use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
+use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
+use crate::core::protocol::phantom_crypto::batch::integration::BatchSystem;
 
-pub async fn connect_to_phantom_server(
-    server_addr: &str,
-) -> Result<(TcpStream, Arc<PhantomPacketProcessor>), Box<dyn std::error::Error + Send + Sync>> {
-    info!("🔗 Connecting to phantom server at {}...", server_addr);
+// Добавляем импорт функции из connection_manager
+use crate::core::protocol::server::connection_manager_phantom::handle_phantom_client_connection;
 
-    // Подключение к серверу
-    let mut stream = match timeout(
+pub async fn handle_phantom_connection(
+    mut stream: TcpStream,
+    peer: std::net::SocketAddr,
+    session_manager: Arc<PhantomSessionManager>,
+    connection_manager: Arc<PhantomConnectionManager>,
+    batch_system: Arc<BatchSystem>,  // Изменён тип
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("👻 Handling phantom connection from {}", peer);
+
+    // Выполняем handshake
+    let handshake_result = match timeout(
         Duration::from_secs(10),
-        TcpStream::connect(server_addr)
+        perform_phantom_handshake(&mut stream, HandshakeRole::Server)
     ).await {
-        Ok(Ok(stream)) => {
-            info!("✅ Connected to server at {}", server_addr);
-            stream
-        }
-        Ok(Err(e)) => {
-            error!("❌ Connection failed: {}", e);
-            return Err(Box::new(e));
-        }
+        Ok(result) => result,
         Err(_) => {
-            error!("❌ Connection timeout");
-            return Err("Connection timeout".into());
+            error!("Handshake timeout for {}", peer);
+            return Ok(());
         }
     };
 
-    // Выполнение handshake
-    info!("🤝 Performing phantom handshake...");
-    let handshake_result = perform_phantom_handshake(&mut stream, HandshakeRole::Client).await?;
+    let handshake_result = match handshake_result {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Handshake failed for {}: {}", peer, e);
+            return Ok(());
+        }
+    };
 
-    info!("✅ Handshake completed! Session ID: {}",
-          hex::encode(handshake_result.session.session_id()));
-    info!("🕐 Handshake time: {:?}", handshake_result.handshake_time);
+    let session = Arc::new(handshake_result.session);
+    let session_id = session.session_id().to_vec();
 
-    let packet_processor = Arc::new(PhantomPacketProcessor::new());
+    info!("✅ Phantom handshake completed for {} session: {}",
+          peer, hex::encode(&session_id));
 
-    Ok((stream, packet_processor))
-}
-
-pub async fn send_phantom_packet(
-    stream: &mut TcpStream,
-    packet_processor: &PhantomPacketProcessor,
-    session: &crate::core::protocol::phantom_crypto::core::keys::PhantomSession,
-    packet_type: u8,
-    payload: &[u8],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Создаем зашифрованный пакет
-    let packet_data = packet_processor.create_outgoing_vec(session, packet_type, payload)?;
-
-    // Отправляем пакет
-    crate::core::protocol::packets::frame_writer::write_frame(stream, &packet_data).await?;
-
-    info!("📤 Packet 0x{:02X} sent ({} bytes)", packet_type, payload.len());
-    Ok(())
-}
-
-pub async fn receive_phantom_packet(
-    stream: &mut tokio::net::tcp::OwnedReadHalf,
-    packet_processor: &PhantomPacketProcessor,
-    session: &crate::core::protocol::phantom_crypto::core::keys::PhantomSession,
-) -> Result<Option<(u8, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
-    // Читаем фрейм
-    let frame_data = crate::core::protocol::packets::frame_reader::read_frame(stream).await?;
-
-    if frame_data.is_empty() {
-        return Ok(None); // Соединение закрыто
+    // Регистрируем сессию
+    if let Err(e) = session_manager.add_session_with_addr(&session_id, session.clone(), peer).await {
+        error!("Failed to register session: {}", e);
+        return Ok(());
     }
 
-    // Обрабатываем пакет
-    let (packet_type, decrypted_data) = packet_processor.process_incoming_vec(&frame_data, session)?;
-
-    Ok(Some((packet_type, decrypted_data)))
+    // Используем новую batch-интегрированную функцию
+    match handle_phantom_client_connection(
+        stream,
+        peer,
+        session,
+        session_manager.clone(),
+        connection_manager.clone(),
+        batch_system.clone(),
+    ).await {
+        Ok(()) => {
+            info!("✅ Connection {} processed successfully", peer);
+            Ok(())
+        }
+        Err(e) => {
+            error!("❌ Connection {} failed: {}", peer, e);
+            // Все равно возвращаем Ok, чтобы не падать на одной ошибке соединения
+            Ok(())
+        }
+    }
 }

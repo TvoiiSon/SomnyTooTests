@@ -1,5 +1,4 @@
 pub mod config;
-pub mod test_client;
 
 // CORE
 pub mod core {
@@ -25,26 +24,25 @@ pub mod core {
                 pub mod runtime;
             }
             pub mod batch {
-                pub mod io {
-                    pub mod writer {
-                        pub mod batch_writer;
-                    }
-                    pub mod reader {
-                        pub mod batch_reader;
-                    }
-                }
-                pub mod buffer {
-                    pub mod unified_buffer_pool;
-                    pub mod config;
+                pub mod core {
+                    pub mod reader;
+                    pub mod writer;
+                    pub mod dispatcher;
+                    pub mod processor;
+                    pub mod buffer;
                 }
                 pub mod types {
-                    pub mod error;
                     pub mod priority;
+                    pub mod error;
+                    pub mod result;
+                    pub mod state;
                 }
+
+                pub mod config;
+                pub mod integration;
             }
         }
         pub mod packets {
-            pub mod priority;
             pub mod packet_service;
             pub mod frame_reader;
             pub mod frame_writer;
@@ -55,8 +53,4 @@ pub mod core {
             pub mod connection_manager_phantom;
         }
     }
-}
-
-pub mod tests {
-    pub mod ping_sender;
 }
