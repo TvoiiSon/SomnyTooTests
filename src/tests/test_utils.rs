@@ -72,8 +72,11 @@ pub async fn read_frame(read_stream: &mut (impl AsyncReadExt + Unpin)) -> Result
 
 /// Closes connection gracefully
 pub async fn close_connection(write_stream: &mut (impl AsyncWriteExt + Unpin)) {
+    // Сначала пытаемся корректно завершить отправку
     if let Err(e) = write_stream.shutdown().await {
-        tracing::debug!("Test stream shutdown error: {}", e);
+        tracing::debug!("Stream shutdown error (expected for some connections): {}", e);
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    
+    // Небольшая пауза для завершения операций
+    tokio::time::sleep(Duration::from_millis(10)).await;
 }

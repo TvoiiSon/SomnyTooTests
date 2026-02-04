@@ -1,5 +1,6 @@
 use std::time::Duration;
 use anyhow::Result;
+use anyhow::Context; // ДОБАВИТЬ ЭТОТ ИМПОРТ
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
 use tracing::{info, error, warn};
 use clap::Parser;
@@ -22,6 +23,26 @@ struct Args {
     /// Run integration test
     #[arg(short = 'i', long)]
     integration: bool,
+
+    /// Run stress test
+    #[arg(long = "stress")]
+    stress_test: bool,
+
+    /// Run quick stress test
+    #[arg(long = "stress-quick")]
+    stress_test_quick: bool,
+
+    /// Run intensive stress test
+    #[arg(long = "stress-intensive")]
+    stress_test_intensive: bool,
+
+    /// Run stability test
+    #[arg(long = "stability")]
+    stability_test: bool,
+
+    /// Custom stress test configuration
+    #[arg(long = "stress-config", value_name = "CLIENTS:CONCURRENT:PACKETS:DELAY_MS")]
+    stress_config: Option<String>,
 }
 
 #[tokio::main]
@@ -50,7 +71,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Check if we're running tests
-    if args.test_ping || args.multiple_pings.is_some() || args.all_tests || args.integration {
+    if args.test_ping || args.multiple_pings.is_some() || args.all_tests ||
+        args.integration || args.stress_test || args.stress_test_quick ||
+        args.stress_test_intensive || args.stability_test || args.stress_config.is_some() {
         run_tests(args).await
     } else {
         // Original client functionality
@@ -108,6 +131,86 @@ async fn run_tests(args: Args) -> Result<()> {
         }
     }
 
+    // Стресс-тесты
+    if args.stress_test || args.all_tests {
+        info!("\n📋 Running stress test...");
+        match somnytoo_test::tests::stress_test::stress_test_quick().await {
+            Ok(_) => {
+                info!("✅ Stress test: PASSED");
+                test_results.push("Stress test: PASSED".to_string());
+            }
+            Err(e) => {
+                error!("❌ Stress test: FAILED - {}", e);
+                test_results.push(format!("Stress test: FAILED - {}", e));
+            }
+        }
+    }
+
+    if args.stress_test_quick {
+        info!("\n📋 Running quick stress test...");
+        match somnytoo_test::tests::stress_test::stress_test_quick().await {
+            Ok(_) => {
+                info!("✅ Quick stress test: PASSED");
+                test_results.push("Quick stress test: PASSED".to_string());
+            }
+            Err(e) => {
+                error!("❌ Quick stress test: FAILED - {}", e);
+                test_results.push(format!("Quick stress test: FAILED - {}", e));
+            }
+        }
+    }
+
+    if args.stress_test_intensive {
+        info!("\n📋 Running intensive stress test...");
+        match somnytoo_test::tests::stress_test::stress_test_intensive().await {
+            Ok(_) => {
+                info!("✅ Intensive stress test: PASSED");
+                test_results.push("Intensive stress test: PASSED".to_string());
+            }
+            Err(e) => {
+                error!("❌ Intensive stress test: FAILED - {}", e);
+                test_results.push(format!("Intensive stress test: FAILED - {}", e));
+            }
+        }
+    }
+
+    if args.stability_test {
+        info!("\n📋 Running stability test...");
+        match somnytoo_test::tests::stress_test::stability_test().await {
+            Ok(_) => {
+                info!("✅ Stability test: PASSED");
+                test_results.push("Stability test: PASSED".to_string());
+            }
+            Err(e) => {
+                error!("❌ Stability test: FAILED - {}", e);
+                test_results.push(format!("Stability test: FAILED - {}", e));
+            }
+        }
+    }
+
+    // Кастомная конфигурация стресс-теста
+    if let Some(config_str) = args.stress_config {
+        info!("\n📋 Running custom stress test with config: {}", config_str);
+        match parse_custom_config(&config_str) {
+            Ok(config) => {
+                match somnytoo_test::tests::stress_test::run_stress_test(config).await {
+                    Ok(_) => {
+                        info!("✅ Custom stress test: PASSED");
+                        test_results.push("Custom stress test: PASSED".to_string());
+                    }
+                    Err(e) => {
+                        error!("❌ Custom stress test: FAILED - {}", e);
+                        test_results.push(format!("Custom stress test: FAILED - {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                error!("❌ Failed to parse stress test config: {}", e);
+                test_results.push(format!("Custom stress test config parse FAILED - {}", e));
+            }
+        }
+    }
+
     // Print summary
     info!("\n📊 Test Summary:");
     info!("{}", "=".repeat(50));
@@ -161,4 +264,30 @@ async fn run_client() -> Result<()> {
     info!("👋 Client shutdown complete");
 
     Ok(())
+}
+
+// Вспомогательная функция для парсинга кастомной конфигурации
+fn parse_custom_config(config_str: &str) -> Result<somnytoo_test::tests::stress_test::StressTestConfig> {
+    let parts: Vec<&str> = config_str.split(':').collect();
+
+    if parts.len() != 4 {
+        return Err(anyhow::anyhow!("Config format should be CLIENTS:CONCURRENT:PACKETS:DELAY_MS"));
+    }
+
+    let total_clients = parts[0].parse::<usize>()
+        .context("Invalid clients number")?;
+    let max_concurrent = parts[1].parse::<usize>()
+        .context("Invalid concurrent connections number")?;
+    let packets_per_client = parts[2].parse::<usize>()
+        .context("Invalid packets per client number")?;
+    let packet_delay_ms = parts[3].parse::<u64>()
+        .context("Invalid delay ms")?;
+
+    Ok(somnytoo_test::tests::stress_test::StressTestConfig {
+        total_clients,
+        max_concurrent,
+        packets_per_client,
+        packet_delay_ms,
+        ..Default::default()
+    })
 }

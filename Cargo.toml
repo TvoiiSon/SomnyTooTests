@@ -31,6 +31,7 @@ blake3 = "1.8"
 rayon = "1.11"
 chrono = "0.4.43"
 clap = { version = "4.5.56", features = ["derive"] }
+rand = "0.8.5"
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["full", "test-util"] }
